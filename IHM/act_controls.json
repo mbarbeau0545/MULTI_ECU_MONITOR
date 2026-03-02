@@ -1,0 +1,13 @@
+{
+  "PWR_MTR_XL": {
+    "PWR_MTR_XL_RLY": 1000
+  },
+  "PWR_MTR_XR": {},
+  "PWR_MTR_Y": {},
+  "PWR_MTR_Z": {},
+  "PWR_WHL_AV_L": {},
+  "PWR_WHL_AV_R": {},
+  "PWR_MTR_HD_KNF": {},
+  "PWR_MTR_HD_CNTR_KNF": {},
+  "PWR_MTR_HD_HOLD": {}
+}

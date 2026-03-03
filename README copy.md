@@ -1,85 +1,60 @@
-﻿# Multi ECU Monitor
+﻿# MULTI_ECU_MONITOR
 
-Architecture modulaire dans `tools/multi_ecu_monitor/app`.
+Monitor SIL/HIL multi-ECU avec IHM SignalViewer + I/O PCSIM.
 
-## But
+## Architecture CAN centralisee (nouveau)
 
-- 1 fichier JSON d'entrée avec N ECU
-- 1 onglet principal par ECU
-- Utilisation de `CANMngmt.py` (via `FrameMngmt` / `IhmSigViewer`) pour toute la couche CAN dans les onglets SignalViewer.
+Le mode SIL peut maintenant lancer un **broker CAN central** qui connecte tous les `program.exe` PCSIM.
 
-## Mode Global
+- Chaque ECU continue d'avoir son endpoint UDP PCSIM (`udp.host/port`).
+- Le broker lit les trames TX de chaque ECU via une **file dediee broker** (`POP_CAN_BROKER_TX_BURST`).
+- Le broker route par `node` CAN (ex: 0,2,3,4) et par abonnement RX:
+  - filtres statiques JSON (`pcsim_can.rx_filters`), ou
+  - abonnements reels de l'exe (`DUMP_CAN_RX_REG_BURST`) si aucun filtre statique.
+- Le broker injecte ensuite la trame vers les ECU abonnes (`INJECT_CAN_EX`).
 
-Dans `ecus_config.json`:
+Important: la file `POP_CAN_TX_BURST` historique est conservee pour les viewers/IHM et n'est plus consommee par le broker.
 
-- `general.mode = "SIL"`:
-  - onglet `I/O` actif (pilotage direct `program.exe` via PC_SIM UDP)
-  - onglet `SignalViewer` actif
-- `general.mode = "HIL"`:
-  - pas d'onglet `I/O`
-  - uniquement onglet `SignalViewer` (Messages, MessageSender, Sensors, Actuators, Graph...)
+## Configuration JSON
 
-## Structure
+Fichier: `Doc/ConfigPrj/ecus_config.json`
 
-- `app/config.py`: parsing config globale + ECU
-- `app/fmkio_parser.py`: lecture comptes I/O depuis `FMKIO_ConfigPublic.h`
-- `app/sil_io_tab.py`: onglet I/O SIL
-- `app/signalviewer_embed.py`: intégration widget `IhmSigViewer.SignalViewer` par ECU
-- `app/ecu_page.py`: composition des sous-onglets ECU
-- `app/main_window.py`: fenêtre principale
-- `app/launcher.py`: point d'entrée applicatif
-- `multi_ecu_monitor.py`: launcher mince
-
-## Config JSON
-
-Exemple minimal:
+### General
 
 ```json
-{
-  "general": {
-    "mode": "SIL",
-    "refresh_ms": 200
-  },
-  "ecus": [
-    {
-      "name": "ECU_1",
-      "sym_file": "../../Doc/.../SafetyPrjMsgDefinition.sym",
-      "project_software_cfg": "../../Src/Config/project_cfg_ecn1.json",
-      "fmkio_config_public": "../../src/1_FMK/.../FMKIO_COnfigPublic.h",
-      "can_gate": "PCSIM",
-      "can_speed_bps": 500000,
-      "udp": {
-        "host": "127.0.0.1",
-        "port": 19090,
-        "timeout_s": 0.4,
-        "node": 0
-      }
-    }
-  ]
+"general": {
+  "mode": "SIL",
+  "refresh_ms": 50,
+  "can_broker": {
+    "enabled": true,
+    "control_port": 19600,
+    "poll_sleep_s": 0.001,
+    "max_pop_per_ecu": 128,
+    "max_inject_per_cycle": 2048
+  }
 }
 ```
 
-Notes:
+### Par ECU (PCSIM)
 
-- `project_software_cfg` peut être un JSON de projet SignalViewer existant.
-- Si `can_gate = PCSIM`, le bridge CAN utilise `udp.host/port/node`.
-- Si `can_gate != PCSIM`, définir `can_device_port` dans l'ECU.
+Sous `pcsim_can`:
+
+- `shared_can_nodes`: liste des index CAN partages (ex `[0,2,3,4]`)
+- `rx_filters`: filtres optionnels `[{"node":0,"id":"0x18FF0130","mask":"0x1FFFFFFF","extended":true}]`
+
+Si `rx_filters` est vide, le broker utilise les abonnements RX reels exposes par l'exe.
 
 ## Lancement
 
-```bash
-pip install PyQt5 pyqtgraph
-python tools/multi_ecu_monitor/multi_ecu_monitor.py --config tools/multi_ecu_monitor/ecus_config.json
-```
+- Multi monitor: `python tools/MultiEcuMonitor/multi_ecu_monitor.py --config Doc/ConfigPrj/ecus_config.json`
+- Broker seul (sans IHM): `python tools/MultiEcuMonitor/can_broker.py --config Doc/ConfigPrj/ecus_config.json`
+- Lancement ECU via `.bat`: `Doc/ConfigPrj/launch_multi_exe.bat`
+  - Le script ping `127.0.0.1:<general.can_broker.control_port>`.
+  - Si broker deja present: il ne relance pas un second broker.
+  - Si absent: il demarre `tools/MultiEcuMonitor/can_broker.py` puis lance les ECU.
 
-## Validation config
+## Notes runtime
 
-Au démarrage, un validateur vérifie:
-
-- existence des chemins (`sym_file`, `project_software_cfg`, `fmkio_config_public`)
-- mode global (`SIL`/`HIL`)
-- `can_gate` autorisé (`PCSIM`, `PEAK`, `WAVESHARE`)
-- paramètres UDP (`host`, `port`, `timeout_s`, `node`)
-- doublons de endpoints UDP PCSIM (`host:port`)
-
-En cas d'erreur, l'application s'arrête avec un message détaillé.
+- La barre de statut affiche l'etat broker: `rx`, `routed`, `injected`, `dropped`, `cycle`, `err`.
+- Le broker ne s'active que si `general.can_broker.enabled=true` et au moins 2 ECU PCSIM actifs.
+- Si le monitor est demarre apres le `.bat`, il detecte le broker externe et ne cree pas de doublon.

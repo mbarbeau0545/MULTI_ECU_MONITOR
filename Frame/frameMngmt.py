@@ -1,4 +1,4 @@
-"""
+﻿"""
 #  @file        main.py
 #  @brief       Template_BriefDescription.
 #  @details     TemplateDetailsDescription.\n
@@ -113,6 +113,9 @@ class FrameMngmt():
         self.signals:Dict[str, Dict] = {}
         self.sig_value:Dict[str, Queue] = {}
         self.msg_sig_value:Dict[str, Queue] = {}
+        self._pending_msg_updates_latest: Dict[str, Tuple[int, str, List]] = {}
+        self._latest_sig_value: Dict[str, List] = {}
+        self._latest_msg_sig_value: Dict[str, List] = {}
         self.symbol:Dict[str, Dict] = {}
         self.can_cnt_buff_log:int = 0
         self.srl_cnt_buff_log:int = 0
@@ -150,9 +153,57 @@ class FrameMngmt():
         self._stop_srl_thread = threading.Event()
         self._stop_can_thread = threading.Event()
         self._start_time = time.time_ns()
+        self._can_cyclic_rx_total = 0
+        self._can_cyclic_processed_total = 0
 
         #---- extract signals enum and stuff ----#
         self.__extract_signal_cfg()
+        self._build_symbol_indexes()
+
+    def _build_symbol_indexes(self) -> None:
+        self._symbol_by_can_id_exact: Dict[int, Dict] = {}
+        self._symbol_by_can_id16: Dict[int, List[Dict]] = {}
+        self._symbol_by_serial_id: Dict[int, Dict] = {}
+        for _, sym in self.symbol.items():
+            msg_id = sym.get("msg_id")
+            if msg_id is None:
+                continue
+            try:
+                msg_id_int = int(msg_id)
+            except Exception:
+                continue
+            self._symbol_by_can_id_exact[msg_id_int] = sym
+            low_id = msg_id_int & 0x0000FFFF
+            if low_id not in self._symbol_by_can_id16:
+                self._symbol_by_can_id16[low_id] = []
+            self._symbol_by_can_id16[low_id].append(sym)
+            self._symbol_by_serial_id[msg_id_int] = sym
+
+    def _register_signal_sample(self, msg_id: int, signal_name: str, sample: List) -> None:
+        if signal_name not in self.sig_value.keys():
+            self.sig_value[signal_name] = Queue()
+
+        msg_sig_name = str(msg_id) + signal_name
+        if msg_sig_name not in self.msg_sig_value.keys():
+            self.msg_sig_value[msg_sig_name] = Queue()
+
+        # Keep queue compatibility but avoid backlog: store only latest sample.
+        try:
+            while True:
+                self.msg_sig_value[msg_sig_name].get_nowait()
+        except Empty:
+            pass
+        try:
+            while True:
+                self.sig_value[signal_name].get_nowait()
+        except Empty:
+            pass
+
+        self.msg_sig_value[msg_sig_name].put(sample)
+        self.sig_value[signal_name].put(sample)
+        self._latest_sig_value[str(signal_name)] = sample
+        self._latest_msg_sig_value[msg_sig_name] = sample
+        self._pending_msg_updates_latest[msg_sig_name] = (int(msg_id), str(signal_name), sample)
 
     #--------------------------
     # get_signal_value
@@ -167,6 +218,11 @@ class FrameMngmt():
             KeyError: if the signals is not found.
         """
         result:List[int] = []
+        latest = self._latest_sig_value.get(str(f_signal))
+        if latest is not None:
+            result.append(latest)
+            return result
+
         sig_queue = self.sig_value.get(f_signal)
         if sig_queue is None:
             raise KeyError(f"{f_signal} does not exist in Signal Configuration")
@@ -174,7 +230,7 @@ class FrameMngmt():
         # Vide la queue
         try:
             while True:
-                # get_nowait lève Empty si la queue est vide
+                # get_nowait lÃ¨ve Empty si la queue est vide
                 item = sig_queue.get_nowait()
                 result.append(item)
         except Empty:
@@ -194,6 +250,11 @@ class FrameMngmt():
         """
         result:List[int] = []
         key_msg_sig = str(f_msg_id) + f_signal
+        latest = self._latest_msg_sig_value.get(key_msg_sig)
+        if latest is not None:
+            result.append(latest)
+            return result
+
         sig_queue = self.msg_sig_value.get(key_msg_sig)
         if sig_queue is None:
             raise KeyError(f"{key_msg_sig} does not exist in Signal Configuration")
@@ -201,13 +262,32 @@ class FrameMngmt():
         # Vide la queue
         try:
             while True:
-                # get_nowait lève Empty si la queue est vide
+                # get_nowait lÃ¨ve Empty si la queue est vide
                 item = sig_queue.get_nowait()
                 result.append(item)
         except Empty:
             pass
         
         return result
+
+    def get_pending_msg_updates(self, f_max_items: int = 5000) -> List[Tuple[int, str, List]]:
+        if f_max_items <= 0:
+            return []
+
+        keys = list(self._pending_msg_updates_latest.keys())
+        if len(keys) == 0:
+            return []
+        selected = keys[:f_max_items]
+        result = [self._pending_msg_updates_latest[k] for k in selected]
+        for k in selected:
+            self._pending_msg_updates_latest.pop(k, None)
+        return result
+
+    def get_pending_msg_updates_count(self) -> int:
+        return int(len(self._pending_msg_updates_latest))
+
+    def get_latest_signal_value(self, f_signal: str) -> Optional[List]:
+        return self._latest_sig_value.get(str(f_signal))
     #--------------------------
     # send_signal_msg
     #--------------------------
@@ -239,7 +319,7 @@ class FrameMngmt():
         signals = symbol['signals']['0']  # pas de mux pour l'instant
 
         # Payload vide (par ex. 8 octets)
-        payload = bytearray(self._srl_frame_len - 3)  # sans header/id/checksum
+        payload = bytearray(8)  # sans header/id/checksum
 
         for signal_name, start_bit in signals.items():
             if signal_name not in f_sigvalue:
@@ -259,19 +339,12 @@ class FrameMngmt():
                 encoding = "big"
             else:
                 encoding = "little"
-            # Appliquer l’inverse du décodage
+            # Appliquer lâ€™inverse du dÃ©codage
             eng_value = f_sigvalue[signal_name]
             raw_value = int((eng_value - offset) / factor)
 
-            # update the value in container 
-            if signal_name not in self.sig_value.keys():
-                self.sig_value[signal_name] = Queue()
-            msg_sig_name = str(msg_id) + signal_name
-            if msg_sig_name not in self.msg_sig_value.keys():
-                self.msg_sig_value[msg_sig_name] = Queue()
-            
-            self.msg_sig_value[msg_sig_name].put([raw_value, eng_value, time.time_ns()])
-            self.sig_value[signal_name].put([raw_value, eng_value, time.time_ns()])
+            sample = [raw_value, eng_value, time.time_ns()]
+            self._register_signal_sample(msg_id, signal_name, sample)
 
             self.__insert_bits(payload, raw_value, start_bit, length, encoding)
 
@@ -362,8 +435,25 @@ class FrameMngmt():
             self._srl_frame_thread.start()
 
         if self._is_can_enable:
-            self._can_istc.connect(device_port = self.prj_cfg_data["can_cfg"]["device_port"], can_speed_bps= self.prj_cfg_data["can_cfg"]["can_speed_bps"]) 
+            self._can_cyclic_rx_total = 0
+            self._can_cyclic_processed_total = 0
+            can_cfg = self.prj_cfg_data["can_cfg"]
+            connect_kwargs = {
+                "device_port": can_cfg["device_port"],
+                "can_speed_bps": can_cfg["can_speed_bps"],
+            }
+            if "timeout_s" in can_cfg:
+                connect_kwargs["timeout_s"] = can_cfg["timeout_s"]
+            if "poll_sleep_s" in can_cfg:
+                connect_kwargs["poll_sleep_s"] = can_cfg["poll_sleep_s"]
+            if "max_pop_per_cycle" in can_cfg:
+                connect_kwargs["max_pop_per_cycle"] = can_cfg["max_pop_per_cycle"]
+            if "clear_can_tx_on_connect" in can_cfg:
+                connect_kwargs["clear_can_tx_on_connect"] = can_cfg["clear_can_tx_on_connect"]
+
+            self._can_istc.connect(**connect_kwargs)
             self._can_istc.flush()
+            self._can_istc.reset_stats()
             self._can_istc.receive_queue_start()
             self._stop_can_thread.clear()
             self._can_frame_thread = threading.Thread(target=self._cyclic_can_frame, daemon=True)
@@ -432,9 +522,13 @@ class FrameMngmt():
         buffer_log:str = ''
 
         while not self._stop_can_thread.is_set():
-            can_frame = self._can_istc.get_can_frame()
+            can_frame = self._can_istc.get_can_frame(f_timeout=0.005)
+
+            if can_frame.data != []:
+                self._can_cyclic_rx_total += 1
 
             if can_frame.data != [] and can_frame.id not in self._can_id_ignore:
+                self._can_cyclic_processed_total += 1
                 buffer_log += self.__decode_can_frame(can_frame)
 
                 if self._enable_cansig_log:
@@ -447,6 +541,21 @@ class FrameMngmt():
             else:
                 #print('got nothing')
                 time.sleep(0.001)
+
+    def get_can_runtime_stats(self) -> Dict[str, int]:
+        low_stats = {"low_rx_total": 0, "low_queue_total": 0}
+        if self._can_istc is not None:
+            try:
+                low_stats = self._can_istc.get_stats()
+            except Exception:
+                pass
+
+        return {
+            "low_rx_total": int(low_stats.get("low_rx_total", 0)),
+            "low_queue_total": int(low_stats.get("low_queue_total", 0)),
+            "cyclic_rx_total": int(self._can_cyclic_rx_total),
+            "cyclic_processed_total": int(self._can_cyclic_processed_total),
+        }
                 
 
     #--------------------------
@@ -464,15 +573,11 @@ class FrameMngmt():
         if len(srl_data) < self._srl_frame_len:
             print("[ERROR] : Trame trop courte")
             return ''
-        # 3e octet = id (en hex string pour correspondre à msg_id dans symbol)
+        # 3e octet = id (en hex string pour correspondre Ã  msg_id dans symbol)
         msg_id = f"{srl_data[2]:03X}"  # ex: '010' ou '020'
 
-        # Recherche du symbole correspondant à msg_id
-        symbol = None
-        for sym_name, sym in self.symbol.items():
-            if sym['msg_id'] == int(msg_id, 16):
-                symbol = sym
-                break
+        # Recherche du symbole correspondant Ã  msg_id
+        symbol = self._symbol_by_serial_id.get(int(msg_id, 16))
 
         if symbol is None:
             print(f"[ERROR] : Symbole inconnu pour msg_id {msg_id}")
@@ -496,7 +601,7 @@ class FrameMngmt():
             # Extraire la valeur brute du signals (bitfield)
             raw_value = self.__extract_bits(srl_data[3:], start_bit, length, encoding)
 
-            # Si enum est défini, traduire la valeur
+            # Si enum est dÃ©fini, traduire la valeur
             if enum_name and enum_name in self.enum:
                 enum_map = {entry[0]: entry[1] for entry in self.enum[enum_name]}
                 value = enum_map.get(raw_value, raw_value)  # sinon valeur brute
@@ -505,16 +610,9 @@ class FrameMngmt():
                 # Appliquer facteur et offset
                 value = raw_value * factor + offset
 
-            # Stocker la valeur dans la queue associée
-            if signal_name not in self.sig_value.keys():
-                self.sig_value[signal_name] = Queue()
-
-            msg_sig_name = str(msg_id) + signal_name
-            if msg_sig_name not in self.msg_sig_value.keys():
-                self.msg_sig_value[msg_sig_name] = Queue()
-            
-            self.msg_sig_value[msg_sig_name].put([raw_value, value, ts])
-            self.sig_value[signal_name].put([raw_value, value, ts])
+            # Stocker la valeur dans la queue associÃ©e
+            sample = [raw_value, value, ts]
+            self._register_signal_sample(int(msg_id, 16), signal_name, sample)
 
             buffer_log += f'{(ts - self._start_time) / 1e6} {signal_name} {raw_value} {value}\n'
 
@@ -531,13 +629,14 @@ class FrameMngmt():
         """
         msg_id = f_can_frame.id
         bufffer_log = ''
-
-        # Recherche du symbole correspondant à msg_id
-        symbol = None
-        for sym_name, sym in self.symbol.items():
-            if int(sym['msg_id']& 0x0000FFFF) == int(msg_id & 0x0000FFFF):
-                symbol = sym
-                break
+        # if int(msg_id) == 0x18FF0130:
+        #     print(f"[DBG CAN RX] id=0x{msg_id:X} ts={f_can_frame.timestamp} dlc={f_can_frame.length} data={list(f_can_frame.data)}")
+        # Recherche du symbole correspondant Ã  msg_id
+        symbol = self._symbol_by_can_id_exact.get(int(msg_id))
+        if symbol is None:
+            candidates = self._symbol_by_can_id16.get(int(msg_id & 0x0000FFFF), [])
+            if len(candidates) > 0:
+                symbol = candidates[0]
 
         if symbol is None:
             pass#print(f"[ERROR] : Symbole inconnu pour msg_id {msg_id}")
@@ -575,7 +674,7 @@ class FrameMngmt():
             # Extraire la valeur brute du signals (bitfield)
             raw_value = self.__extract_bits(raw_data, start_bit, length, encoding)
 
-            # Si enum est défini, traduire la valeur
+            # Si enum est dÃ©fini, traduire la valeur
             if enum_name and enum_name in self.enum:
                 enum_map = {entry[0]: entry[1] for entry in self.enum[enum_name]}
                 value = enum_map.get(raw_value, raw_value)  # sinon valeur brute
@@ -584,16 +683,9 @@ class FrameMngmt():
                 # Appliquer facteur et offset
                 value = raw_value * factor + offset
 
-            # Stocker la valeur dans la queue associée
-            if signal_name not in self.sig_value.keys():
-                self.sig_value[signal_name] = Queue()
-
-            msg_sig_name = str(msg_id) + signal_name
-            if msg_sig_name not in self.msg_sig_value.keys():
-                self.msg_sig_value[msg_sig_name] = Queue()
-
-            self.msg_sig_value[msg_sig_name].put([raw_value, value, f_can_frame.timestamp])
-            self.sig_value[signal_name].put([raw_value, value, f_can_frame.timestamp])
+            # Stocker la valeur dans la queue associÃ©e
+            sample = [raw_value, value, f_can_frame.timestamp]
+            self._register_signal_sample(msg_id, signal_name, sample)
 
             buffer_log = f"{f_can_frame.timestamp} 0x{msg_id:X} {signal_name} {raw_value} {value}\n"
 
@@ -608,11 +700,11 @@ class FrameMngmt():
         Args:
             data (bytes): trame binaire (ex: 8 octets CAN/SRL)
             start_bit (int): position du 1er bit LSB dans le champ (en bits)
-            length (int): nombre total de bits à extraire
+            length (int): nombre total de bits Ã  extraire
             encoding (str): 'INTEL' (little endian) ou 'MOTOROLA' (big endian)
 
         Returns:
-            int: valeur entière du champ extrait
+            int: valeur entiÃ¨re du champ extrait
         """
         bit_val = 0
         if len(data) != 8:
@@ -622,19 +714,19 @@ class FrameMngmt():
             if encoding.upper() == "INTEL":
                 msg_bit = start_bit + i
             elif encoding.upper() == "MOTOROLA":
-                # Algorithme identique à celui de votre code C
+                # Algorithme identique Ã  celui de votre code C
                 byte = start_bit // 8
                 bit = start_bit % 8
                 msg_bit = (byte * 8 + bit) - i
                 msg_bit = ((7 - (msg_bit // 8)) * 8) + (msg_bit % 8)
             else:
-                raise ValueError(f"Encodage non supporté: {encoding}")
+                raise ValueError(f"Encodage non supportÃ©: {encoding}")
 
             byte_index = msg_bit // 8
             bit_in_byte = msg_bit % 8
 
             if byte_index >= len(data):
-                break  # dépassement de la trame -> ignorer
+                break  # dÃ©passement de la trame -> ignorer
 
             bit = (data[byte_index] >> bit_in_byte) & 0x1
             bit_val |= (bit << i)
@@ -645,7 +737,7 @@ class FrameMngmt():
     # __insert_bits
     #--------------------------
     def __insert_bits(self, buffer:bytearray, value:int, start_bit:int, length:int, encoding:str="little"):
-        """Insère une valeur entière dans le buffer à la position spécifiée"""
+        """InsÃ¨re une valeur entiÃ¨re dans le buffer Ã  la position spÃ©cifiÃ©e"""
         # Convertir buffer en entier global
         total_bits = len(buffer) * 8
         total_value = int.from_bytes(buffer, byteorder=encoding)
@@ -740,22 +832,22 @@ class FrameMngmt():
                 match current_read:
                     case 'ENUMS':
                         if 'Enum=' in line:
-                            # Étape 1 : récupérer la ligne complète entre parenthèses
+                            # Ã‰tape 1 : rÃ©cupÃ©rer la ligne complÃ¨te entre parenthÃ¨ses
                             full_line = line.strip()
                             while ')' not in full_line:
                                 next_line = next(file_iter).strip()  # file_iter = iter(fichier_lignes)
                                 full_line += ' ' + next_line
 
-                            # Étape 2 : extraire le nom de l'enum
+                            # Ã‰tape 2 : extraire le nom de l'enum
                             start_index = full_line.index('Enum=') + len('Enum=')
                             end_index = full_line.index('(')
                             enum_name = full_line[start_index:end_index].strip()
 
-                            # Étape 3 : extraire les paires index = "value"
+                            # Ã‰tape 3 : extraire les paires index = "value"
                             resultats = re.findall(SYM_PATTERN_ENUM, full_line)
                             pairs = [[int(index), value] for index, value in resultats]
 
-                            # Étape 4 : stocker
+                            # Ã‰tape 4 : stocker
                             self.enum[enum_name] = pairs
 
                     case 'SIGNALS':
@@ -766,7 +858,7 @@ class FrameMngmt():
                             encoding_flag = match.group(4)
                             factor        = float(match.group(5)) if match.group(5) else 1
                             offset        = int(match.group(6)) if match.group(6) else 0
-                            # match.group(6) = max (non utilisé ici)
+                            # match.group(6) = max (non utilisÃ© ici)
                             enum_name     = match.group(8) if match.group(8) else None
 
                             encoding = "MOTOROLA" if encoding_flag else "INTEL"
@@ -794,7 +886,7 @@ class FrameMngmt():
                                 'signals': {},
                                 'mux_info' : {},
                                 'timeout': 0,
-                                'cycle_time': None  # <-- Ajouté ici
+                                'cycle_time': None  # <-- AjoutÃ© ici
                             }
                             waiting_for_timeout = True
                             continue
@@ -825,7 +917,7 @@ class FrameMngmt():
 
                                         multi_msg_dir.append(dir_value)
 
-                                    # on réecrit la valeur de la direction
+                                    # on rÃ©ecrit la valeur de la direction
                                     self.symbol[current_symbol]['msg_direction'] = multi_msg_dir
                             continue
 
@@ -862,9 +954,9 @@ class FrameMngmt():
                             position = int(match_sig.group(2))
 
                             if current_symbol:
-                                # Vérifier si le signals est bien défini
+                                # VÃ©rifier si le signals est bien dÃ©fini
                                 if signal_name not in self.signals:
-                                    raise ValueError(f"Signal '{signal_name}' utilisé par '{current_symbol}' non défini dans SIGNALS")
+                                    raise ValueError(f"Signal '{signal_name}' utilisÃ© par '{current_symbol}' non dÃ©fini dans SIGNALS")
 
                                 new_start = position
                                 new_length = self.signals[signal_name]['length']
@@ -1052,4 +1144,5 @@ class FrameMngmt():
     @params[out]
     @retval
 """
+
 

@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from queue import Empty
 from typing import Any, Dict, Optional
+from typing import List
 
 from Library.ModuleLog import log
 
@@ -26,8 +27,9 @@ class PcSimCanConfig:
     host: str = "127.0.0.1"
     port: int = 19090
     node: int = 0
-    timeout_s: float = 0.2
-    poll_sleep_s: float = 0.002
+    timeout_s: float = 0.001
+    poll_sleep_s: float = 0.00005
+    max_pop_per_cycle: int = 128
     clear_can_tx_on_connect: bool = True
 
 
@@ -49,6 +51,7 @@ class PcSimCanMngmt(CANInterface):
         node = kwargs.get("node", cfg.node)
         timeout_s = kwargs.get("timeout_s", kwargs.get("timeout", cfg.timeout_s))
         poll_sleep_s = kwargs.get("poll_sleep_s", cfg.poll_sleep_s)
+        max_pop_per_cycle = kwargs.get("max_pop_per_cycle", cfg.max_pop_per_cycle)
         clear_on_connect = kwargs.get("clear_can_tx_on_connect", cfg.clear_can_tx_on_connect)
 
         if isinstance(device_port, dict):
@@ -72,6 +75,7 @@ class PcSimCanMngmt(CANInterface):
             node=int(node),
             timeout_s=float(timeout_s),
             poll_sleep_s=float(poll_sleep_s),
+            max_pop_per_cycle=max(1, int(max_pop_per_cycle)),
             clear_can_tx_on_connect=bool(clear_on_connect),
         )
 
@@ -90,6 +94,7 @@ class PcSimCanMngmt(CANInterface):
         if self._cfg.clear_can_tx_on_connect:
             self._client.clear_can_tx()
 
+        self.reset_stats()
         self.is_init = True
 
     def disconnect(self) -> None:
@@ -194,7 +199,45 @@ class PcSimCanMngmt(CANInterface):
             data=data,
             timestamp=int(frame.get("timestamp_ms", int(time.time() * 1000))),
         )
+        self._stats["low_rx_total"] += 1
         return msg
+
+    def receive_poll_burst(self, max_frames: int) -> List[StructCANMsg]:
+        if not self.is_init or self._client is None:
+            raise CanModuleNotInitError("Instance Not Init, please use Connect Method first")
+
+        out: List[StructCANMsg] = []
+        try:
+            frames = self._client.pop_can_tx_burst(max_frames)
+        except TimeoutError:
+            return out
+        except Exception as exc:
+            now = time.time()
+            if (now - self._last_rx_warn_ts) > 1.0:
+                print(f"[WARNING] PC_SIM receive error: {exc}")
+                self._last_rx_warn_ts = now
+            return out
+
+        for frame in frames:
+            dlc = int(frame.get("dlc", 0))
+            if dlc < 0:
+                dlc = 0
+            if dlc > self._MC_DLC_8:
+                dlc = self._MC_DLC_8
+            data = [int(v) & 0xFF for v in list(frame.get("data", []))[:dlc]]
+            msg_type = MsgType.CAN_MNGMT_MSG_EXTENDED if bool(frame.get("is_extended", True)) else MsgType.CAN_MNGMT_MSG_STANDARD
+            out.append(
+                StructCANMsg(
+                    id=int(frame.get("can_id", 0)),
+                    msgType=msg_type,
+                    length=dlc,
+                    data=data,
+                    timestamp=int(frame.get("timestamp_ms", int(time.time() * 1000))),
+                )
+            )
+            self._stats["low_rx_total"] += 1
+
+        return out
 
     def flush(self) -> None:
         if not self.is_init or self._client is None:
@@ -210,9 +253,13 @@ class PcSimCanMngmt(CANInterface):
     def _can_reader_cyclic(self) -> None:
         while not self._stop_rx_thread.is_set():
             try:
-                msg = self.receive_poll()
-                if msg.data:
+                got_one = False
+                msgs = self.receive_poll_burst(self._cfg.max_pop_per_cycle)
+                if len(msgs) > 0:
+                    got_one = True
+                for msg in msgs:
                     self._receive_queue.put(msg)
+                    self._stats["low_queue_total"] += 1
                     if self.enable_log:
                         try:
                             self.make_log.LCF_SetMsgLog(
@@ -232,7 +279,8 @@ class PcSimCanMngmt(CANInterface):
                             )
                         except Exception:
                             pass
-                else:
+
+                if not got_one:
                     time.sleep(self._cfg.poll_sleep_s)
             except TimeoutError:
                 # Debug breakpoints on server side are expected to trigger this.

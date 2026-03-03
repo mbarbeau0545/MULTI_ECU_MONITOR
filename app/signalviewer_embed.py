@@ -94,6 +94,22 @@ class EmbeddedSignalViewer(QWidget):
         if "enable_can_msg_logg" not in can_cfg:
             can_cfg["enable_can_msg_logg"] = False
 
+        # PCSIM tuning parameters (low-latency defaults, overridable from ecus_config.json)
+        timeout_s = self.ecu.pcsim_timeout_s if self.ecu.pcsim_timeout_s is not None else self.ecu.udp.timeout_s
+        poll_sleep_s = self.ecu.pcsim_poll_sleep_s if self.ecu.pcsim_poll_sleep_s is not None else 0.00005
+        max_pop_per_cycle = self.ecu.pcsim_max_pop_per_cycle if self.ecu.pcsim_max_pop_per_cycle is not None else 128
+        clear_on_connect = (
+            self.ecu.pcsim_clear_can_tx_on_connect
+            if self.ecu.pcsim_clear_can_tx_on_connect is not None
+            else True
+        )
+        can_cfg["timeout_s"] = float(timeout_s)
+        can_cfg["poll_sleep_s"] = float(poll_sleep_s)
+        can_cfg["max_pop_per_cycle"] = int(max_pop_per_cycle)
+        can_cfg["clear_can_tx_on_connect"] = bool(clear_on_connect)
+        can_cfg["shared_can_nodes"] = [int(v) for v in self.ecu.pcsim_shared_can_nodes]
+        can_cfg["rx_filters"] = [dict(v) for v in self.ecu.pcsim_rx_filters]
+
         runtime_root = ROOT_DIR / "runtime"
         runtime_logs = runtime_root / "logs" / self.ecu.name
         runtime_logs.mkdir(parents=True, exist_ok=True)
@@ -122,7 +138,10 @@ class EmbeddedSignalViewer(QWidget):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self.viewer is not None:
             try:
+                if hasattr(self.viewer, "_persist_on_quit"):
+                    self.viewer._persist_on_quit()
                 self.viewer.kill_all_thread()
+                self.viewer.close()
             except Exception:
                 pass
         super().closeEvent(event)

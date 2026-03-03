@@ -1,3 +1,5 @@
-runtime
-scripts
+runtime/logs
+runtime/*.json
+scripts/*.bat
+scripts/*.ps1
 __pycache__

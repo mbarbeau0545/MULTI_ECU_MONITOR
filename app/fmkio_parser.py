@@ -7,11 +7,46 @@ def _extract_enum_blocks(content: str) -> List[str]:
     return re.findall(r"typedef\s+enum\s*\{(.*?)\}\s*\w+\s*;", content, flags=re.S)
 
 
+def _strip_c_comments(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"//.*?$", "", text, flags=re.M)
+    return text
+
+
+def _split_enum_entries(block: str) -> List[str]:
+    clean = _strip_c_comments(block)
+    return [entry.strip() for entry in clean.split(",") if entry.strip()]
+
+
+def _parse_int_literal(expr: str) -> int:
+    token = expr.strip().strip("()")
+    token = re.sub(r"[uUlL]+$", "", token)
+    return int(token, 0)
+
+
 def _count_from_enum_nb(content: str, nb_token: str) -> int:
     for block in _extract_enum_blocks(content):
-        names = re.findall(r"\b([A-Za-z_]\w*)\b(?=\s*(?:=|,))", block)
-        if nb_token in names:
-            return names.index(nb_token)
+        entries = _split_enum_entries(block)
+        if not entries:
+            continue
+
+        current = -1
+        for entry in entries:
+            if "=" in entry:
+                name, value_expr = entry.split("=", 1)
+                name = name.strip()
+                value_expr = value_expr.strip()
+                try:
+                    current = _parse_int_literal(value_expr)
+                except Exception:
+                    # If expression is not a plain integer literal, keep monotonic order.
+                    current += 1
+            else:
+                name = entry.strip()
+                current += 1
+
+            if name == nb_token:
+                return max(0, current)
     return 0
 
 

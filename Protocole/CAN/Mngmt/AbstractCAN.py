@@ -111,6 +111,10 @@ class CANInterface(ABC):
         self._receive_queue: Queue = Queue()
         self._rx_thread: Optional[Thread] = None
         self._stop_rx_thread = Event()
+        self._stats = {
+            "low_rx_total": 0,      # frame recu du driver/socket
+            "low_queue_total": 0,   # frame place dans la queue interne CAN
+        }
         dir_log_path = kwargs.get('dir_log_path', '')
         if self.enable_log == True:
             if not os.path.isdir(dir_log_path):
@@ -159,6 +163,15 @@ class CANInterface(ABC):
         self._stop_rx_thread.clear()
         self._rx_thread = Thread(target= self._can_reader_cyclic, daemon=True)
         self._rx_thread.start()
+
+    def reset_stats(self) -> None:
+        self._stats = {
+            "low_rx_total": 0,
+            "low_queue_total": 0,
+        }
+
+    def get_stats(self) -> dict:
+        return dict(self._stats)
 
     #------------------------
     # receive_queue_stop

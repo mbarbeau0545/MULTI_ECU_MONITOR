@@ -39,6 +39,7 @@ REFRESH_IMH_SECONDS = 50  # ms
 PLOT_MAX_POINT = 2000
 GRAPH_CONFIG_FILENAME = "graph_config.json"
 ACT_CTRL_FILENAME = "act_controls.json"
+CAN_TX_CFG_FILENAME = "can_tx_config.json"
 # CAUTION : Automatic generated code section: Start #
 
 # CAUTION : Automatic generated code section: End #
@@ -65,8 +66,14 @@ class SignalViewer(QMainWindow):
         
         # --- app paths ---
         self.app_dir = os.path.dirname(os.path.abspath(__file__))
-        self.graph_cfg_path = os.path.join(self.app_dir, GRAPH_CONFIG_FILENAME)
-        self.act_ctrl_path = os.path.join(self.app_dir, ACT_CTRL_FILENAME)
+        cfg_stem = os.path.splitext(os.path.basename(self.prj_cfg))[0]
+        persist_dir = os.path.dirname(os.path.abspath(self.prj_cfg))
+        if not persist_dir:
+            persist_dir = self.app_dir
+        self.graph_cfg_path = os.path.join(persist_dir, f"{cfg_stem}_{GRAPH_CONFIG_FILENAME}")
+        self.act_ctrl_path = os.path.join(persist_dir, f"{cfg_stem}_{ACT_CTRL_FILENAME}")
+        self.can_tx_cfg_path = os.path.join(persist_dir, f"{cfg_stem}_{CAN_TX_CFG_FILENAME}")
+        self.legacy_act_ctrl_path = os.path.join(self.app_dir, ACT_CTRL_FILENAME)
 
         # init frame instance
         self.frame_isct = FrameMngmt(self.prj_cfg)
@@ -90,6 +97,12 @@ class SignalViewer(QMainWindow):
         # msg-specific buffers (avoid collisions when same signal name exists in different CAN IDs)
         self.msg_signals_values = {}   # key: "0xID:Signal" -> deque([raw, calc, ts])
         self.msg_previous_values = {}  # key: (msg_id:int, signal_name:str) -> last raw string
+        self._sensor_row_by_signal = {}
+        self._act_set_row_by_signal = {}
+        self._act_get_row_by_signal = {}
+        self._perf_samples_accum = 0
+        self._perf_last_ts = time.time()
+        self._perf_last_sps = 0.0
         self.frame_isct.get_symbol_list()
 
         
@@ -105,20 +118,8 @@ class SignalViewer(QMainWindow):
         # --- Messages tab (PCAN-Symbol style) ---
         self._init_messages_tab()
 
-        # --- Message Sender tab ---
-        self.msg_sender_widget = QWidget()
-        self.msg_sender_layout = QVBoxLayout(self.msg_sender_widget)
-        btn_add_msg = QPushButton("Add message")
-        btn_add_msg.clicked.connect(self.__add_message_row)
-        self.msg_sender_layout.addWidget(btn_add_msg)
-        self.msg_scroll = QScrollArea()
-        self.msg_scroll.setWidgetResizable(True)
-        self.msg_container = QWidget()
-        self.msg_rows_container = QVBoxLayout(self.msg_container)
-        self.msg_container.setLayout(self.msg_rows_container)
-        self.msg_scroll.setWidget(self.msg_container)
-        self.msg_sender_layout.addWidget(self.msg_scroll)
-        self.tab_widget.addTab(self.msg_sender_widget, "Message Sender")
+        self.msg_sender_rows = []
+        self._init_message_sender_tab()
 
         # --- Sensors / Actuators ---
         self.sensors = SnsInfo(excel_path)
@@ -149,6 +150,9 @@ class SignalViewer(QMainWindow):
 
         # try to restore saved graphs
         self._load_graphs_state()
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._persist_on_quit)
 
 
     #--------------------------
@@ -180,6 +184,11 @@ class SignalViewer(QMainWindow):
         self.btn_refresh = QPushButton("Refresh Connection")
         self.btn_refresh.clicked.connect(self.__connect_ecu)
         toolbar.addWidget(self.btn_refresh)
+
+        self.perf_label = QLabel("RX: 0.0 samp/s | backlog: 0")
+        toolbar.addWidget(self.perf_label)
+        self.can_count_label = QLabel("CAN low_rx=0 low_q=0 cyc_rx=0 cyc_proc=0")
+        toolbar.addWidget(self.can_count_label)
 
         # --- Load Signal CFG ---
         btn_load_signal = QPushButton("Load Signal CFG")
@@ -253,53 +262,51 @@ class SignalViewer(QMainWindow):
         if not self.is_ecu_connected and (curr_time - self.last_try_con) > 5:
             self.__connect_ecu()
             return
+        backlog_before = self.frame_isct.get_pending_msg_updates_count()
+        updates = self.frame_isct.get_pending_msg_updates(8000)
+        if not updates:
+            now = time.time()
+            if (now - self._perf_last_ts) >= 0.5:
+                self._perf_last_sps = self._perf_samples_accum / (now - self._perf_last_ts) if (now - self._perf_last_ts) > 0.0 else 0.0
+                backlog = self.frame_isct.get_pending_msg_updates_count()
+                self.perf_label.setText(f"RX: {self._perf_last_sps:.1f} samp/s | backlog: {backlog}")
+                can_stats = self.frame_isct.get_can_runtime_stats()
+                self.can_count_label.setText(
+                    f"CAN low_rx={can_stats['low_rx_total']} low_q={can_stats['low_queue_total']} "
+                    f"cyc_rx={can_stats['cyclic_rx_total']} cyc_proc={can_stats['cyclic_processed_total']}"
+                )
+                self._perf_samples_accum = 0
+                self._perf_last_ts = now
+            return
+        self._perf_samples_accum += len(updates)
 
-        # Iterate symbols/messages to keep signal context (msg_id + signal_name)
-        for sym_name, sym_info in self.frame_isct.symbol.items():
-            msg_id = sym_info.get('msg_id', None)
-            if msg_id is None:
+        latest_by_signal = {}
+
+        for msg_id, signal_name, sample in updates:
+            if not sample:
                 continue
+            sig_id = self._mk_sig_key(msg_id, signal_name)
+            if sig_id not in self.msg_signals_values:
+                self.msg_signals_values[sig_id] = deque(maxlen=PLOT_MAX_POINT)
+            self.msg_signals_values[sig_id].append(sample)
+            latest_by_signal[(int(msg_id), str(signal_name))] = sample
 
-            # Only mux index '0' is used in this UI refresh for now
-            sigs = sym_info.get('signals', {}).get('0', {})
-            if not isinstance(sigs, dict):
+        for msg_key, sample in latest_by_signal.items():
+            if not sample:
                 continue
+            raw_txt = "" if sample[0] is None else str(sample[0])
+            calc_txt = "" if sample[1] is None else str(sample[1])
+            signal_name = msg_key[1]
+            prev_raw = self.msg_previous_values.get(msg_key)
 
-            for signal_name in sigs.keys():
-                # Pull new samples for this (msg_id, signal)
-                try:
-                    sig_val = self.frame_isct.get_msg_signal_value(str(msg_id), str(signal_name))
-                except Exception:
-                    continue
-
-                if sig_val == [[]] or sig_val == []:
-                    continue
-
-                # Store for plots (msg-specific)
-                sig_id = self._mk_sig_key(msg_id, signal_name)
-                if sig_id not in self.msg_signals_values:
-                    self.msg_signals_values[sig_id] = deque(maxlen=PLOT_MAX_POINT)
-
-                for sig_info in sig_val:
-                    if sig_info:
-                        self.msg_signals_values[sig_id].append(sig_info)
-
-                if not (sig_val and sig_val[-1]):
-                    continue
-
-                raw_txt = "" if sig_val[-1][0] is None else str(sig_val[-1][0])
-                calc_txt = "" if sig_val[-1][1] is None else str(sig_val[-1][1])
-
-                msg_key = (int(msg_id), str(signal_name))
-                prev_raw = self.msg_previous_values.get(msg_key)
-
-                # Update message tree item
-                if hasattr(self, '_sig_items') and msg_key in getattr(self, '_sig_items', {}):
-                    child: QTreeWidgetItem = self._sig_items[msg_key]
+            # Update message tree item
+            if hasattr(self, '_sig_items') and msg_key in getattr(self, '_sig_items', {}):
+                child: QTreeWidgetItem = self._sig_items[msg_key]
+                prev_calc_txt = child.data(1, Qt.DisplayRole)
+                prev_raw_txt = child.data(2, Qt.DisplayRole)
+                if (str(prev_raw_txt) != raw_txt) or (str(prev_calc_txt) != calc_txt):
                     child.setData(2, Qt.DisplayRole, raw_txt)
                     child.setData(1, Qt.DisplayRole, calc_txt)
-
-                    # Highlight on change
                     if prev_raw is not None and prev_raw != raw_txt:
                         brush = QBrush(QColor("yellow"))
                     else:
@@ -307,15 +314,50 @@ class SignalViewer(QMainWindow):
                     child.setBackground(1, brush)
                     child.setBackground(2, brush)
 
-                self.msg_previous_values[msg_key] = raw_txt
+            self.msg_previous_values[msg_key] = raw_txt
 
-                # Update sensors widget values (unique names)
-                if str(signal_name).upper().startswith("SNS"):
-                    self._refresh_sensors_values(str(signal_name), calc_txt)
+            if str(signal_name).upper().startswith("SNS"):
+                self._refresh_sensors_values(str(signal_name), calc_txt)
 
-                # Update act widget values (unique names)
-                if str(signal_name).upper().startswith("ACT"):
-                    self._refresh_actuators_get_values(str(signal_name), calc_txt)
+            if str(signal_name).upper().startswith("ACT"):
+                self._refresh_actuators_get_values(str(signal_name), calc_txt)
+
+        # Ensure Sensors/Actuators always show latest values even when message backlog exists.
+        self._refresh_from_latest_cache()
+
+        now = time.time()
+        dt = now - self._perf_last_ts
+        if dt >= 0.5:
+            self._perf_last_sps = self._perf_samples_accum / dt if dt > 0.0 else 0.0
+            backlog_after = self.frame_isct.get_pending_msg_updates_count()
+            backlog = max(backlog_before, backlog_after)
+            self.perf_label.setText(f"RX: {self._perf_last_sps:.1f} samp/s | backlog: {backlog}")
+            can_stats = self.frame_isct.get_can_runtime_stats()
+            self.can_count_label.setText(
+                f"CAN low_rx={can_stats['low_rx_total']} low_q={can_stats['low_queue_total']} "
+                f"cyc_rx={can_stats['cyclic_rx_total']} cyc_proc={can_stats['cyclic_processed_total']}"
+            )
+            self._perf_samples_accum = 0
+            self._perf_last_ts = now
+
+    def _refresh_from_latest_cache(self):
+        for sig_name in self._sensor_row_by_signal.keys():
+            latest = self.frame_isct.get_latest_signal_value(sig_name)
+            if latest is None or len(latest) < 2:
+                continue
+            self._refresh_sensors_values(sig_name, str(latest[1]))
+
+        for sig_name in self._act_get_row_by_signal.keys():
+            latest = self.frame_isct.get_latest_signal_value(sig_name)
+            if latest is None or len(latest) < 2:
+                continue
+            self._refresh_actuators_get_values(sig_name, str(latest[1]))
+
+        for sig_name in self._act_set_row_by_signal.keys():
+            latest = self.frame_isct.get_latest_signal_value(sig_name)
+            if latest is None or len(latest) < 2:
+                continue
+            self._refresh_actuators_get_values(sig_name, str(latest[1]))
 
     def __open_graph_tab(self, signal_name, saved_signals: List[str] = None):
         widget = QWidget()
@@ -604,6 +646,7 @@ class SignalViewer(QMainWindow):
 
         # Remplissage initial
         keys = list(self.sensors.info.keys())
+        self._sensor_row_by_signal = {}
         self.sensors_table.setRowCount(len(keys))
         for row, key in enumerate(keys):
             self.sensors_table.setItem(row, 0, QTableWidgetItem(key))
@@ -611,6 +654,7 @@ class SignalViewer(QMainWindow):
 
             # Valeur actuelle
             sig_name = self.sensors.info[key]["signal"]
+            self._sensor_row_by_signal[str(sig_name)] = row
             val = self.frame_isct.get_signal_value(sig_name)
             display_val = str(val[-1][1]) if val and val[-1] else "N/A"
             self.sensors_table.setItem(row, 2, QTableWidgetItem(display_val))
@@ -641,10 +685,14 @@ class SignalViewer(QMainWindow):
 
         # Remplissage
         keys = list(self.actuator.info.keys())
+        self._act_set_row_by_signal = {}
+        self._act_get_row_by_signal = {}
         self.actuators_interface_table.setRowCount(len(keys))
         for row, key in enumerate(keys):
             info = self.actuator.info[key]
             self.actuators_interface_table.setItem(row, 0, QTableWidgetItem(key))
+            self._act_set_row_by_signal[str(info["set_sig"])] = row
+            self._act_get_row_by_signal[str(info["get_sig"])] = row
             # Valeurs set et get actuelles
             val_set = self.frame_isct.get_signal_value(info["set_sig"])
             val_get = self.frame_isct.get_signal_value(info["get_sig"])
@@ -751,7 +799,42 @@ class SignalViewer(QMainWindow):
     #--------------------------
     # Message sender UI
     #--------------------------
-    def __add_message_row(self):
+    def _init_message_sender_tab(self):
+        self.msg_sender_widget = QWidget()
+        self.msg_sender_layout = QVBoxLayout(self.msg_sender_widget)
+
+        top_bar = QHBoxLayout()
+        self.msg_symbol_picker = QComboBox()
+        self.msg_symbol_picker.addItems(self.frame_isct.get_symbol_list())
+        self.msg_symbol_picker.setMinimumWidth(300)
+        top_bar.addWidget(QLabel("Message:"))
+        top_bar.addWidget(self.msg_symbol_picker, 1)
+
+        btn_add_msg = QPushButton("Add Selected")
+        btn_add_msg.clicked.connect(lambda: self.__add_message_row(self.msg_symbol_picker.currentText()))
+        top_bar.addWidget(btn_add_msg)
+
+        btn_save = QPushButton("Save TX")
+        btn_save.clicked.connect(self._save_can_tx_controls)
+        top_bar.addWidget(btn_save)
+
+        btn_reset = QPushButton("Reset TX")
+        btn_reset.clicked.connect(self._reset_can_tx_controls)
+        top_bar.addWidget(btn_reset)
+        self.msg_sender_layout.addLayout(top_bar)
+
+        self.msg_scroll = QScrollArea()
+        self.msg_scroll.setWidgetResizable(True)
+        self.msg_container = QWidget()
+        self.msg_rows_container = QVBoxLayout(self.msg_container)
+        self.msg_container.setLayout(self.msg_rows_container)
+        self.msg_scroll.setWidget(self.msg_container)
+        self.msg_sender_layout.addWidget(self.msg_scroll)
+        self.tab_widget.addTab(self.msg_sender_widget, "Message Sender")
+
+        self._load_can_tx_controls()
+
+    def __add_message_row(self, preset_sym_name: str = "", preset_values: Dict = None):
         """Ajoute une ligne pour configurer un message"""
         row_widget = QFrame()
         row_widget.setFrameShape(QFrame.StyledPanel)
@@ -764,6 +847,8 @@ class SignalViewer(QMainWindow):
         combo.addItems(self.frame_isct.get_symbol_list())
         combo.setMinimumWidth(180)
         row_layout.addWidget(combo)
+        if preset_sym_name and combo.findText(preset_sym_name) >= 0:
+            combo.setCurrentText(preset_sym_name)
 
         sig_table = QTableWidget()
         sig_table.setColumnCount(2)
@@ -781,10 +866,10 @@ class SignalViewer(QMainWindow):
         row_layout.addWidget(sig_table, 1)
 
         if combo.count() > 0:
-            self.__populate_signals(sig_table, combo.currentText())
+            self.__populate_signals(sig_table, combo.currentText(), preset_values)
 
         combo.currentTextChanged.connect(
-            lambda sym: self.__populate_signals(sig_table, sym)
+            lambda sym: self.__populate_signals(sig_table, sym, None)
         )
 
         right_layout = QVBoxLayout()
@@ -794,17 +879,34 @@ class SignalViewer(QMainWindow):
         cyc_layout.addWidget(QLabel("Cyclic (ms):"))
         cyclic_edit = QLineEdit("0")
         cyclic_edit.setFixedWidth(60)
+        if isinstance(preset_values, dict):
+            try:
+                cyclic_edit.setText(str(int(preset_values.get("cyclic_ms", 0))))
+            except Exception:
+                cyclic_edit.setText("0")
         cyc_layout.addWidget(cyclic_edit)
         right_layout.addLayout(cyc_layout)
 
-        btn_send = QPushButton("Send")
-        btn_send.setFixedWidth(70)
-        right_layout.addWidget(btn_send)
+        btn_once = QPushButton("Send Once")
+        btn_once.setFixedWidth(90)
+        right_layout.addWidget(btn_once)
 
-        btn_send.clicked.connect(
+        btn_cyclic = QPushButton("Start Cyclic")
+        btn_cyclic.setFixedWidth(90)
+        right_layout.addWidget(btn_cyclic)
+
+        status_label = QLabel("stopped")
+        right_layout.addWidget(status_label)
+
+        btn_once.clicked.connect(
             lambda _, cb=combo, st=sig_table, ce=cyclic_edit, rw=row_widget:
                 self.__send_message(cb.currentText(), st, ce.text(), rw)
         )
+        btn_cyclic.clicked.connect(
+            lambda _, cb=combo, st=sig_table, ce=cyclic_edit, rw=row_widget, bs=btn_cyclic, sl=status_label:
+                self.__toggle_cyclic_message(cb.currentText(), st, ce.text(), rw, bs, sl)
+        )
+        cyclic_edit.editingFinished.connect(self._save_can_tx_controls)
 
         btn_delete = QPushButton("Delete")
         btn_delete.setFixedWidth(70)
@@ -817,8 +919,16 @@ class SignalViewer(QMainWindow):
         row_layout.addLayout(right_layout)
 
         self.msg_rows_container.addWidget(row_widget)
+        row_widget._combo = combo
+        row_widget._sig_table = sig_table
+        row_widget._cyclic_edit = cyclic_edit
+        row_widget._btn_cyclic = btn_cyclic
+        row_widget._status_label = status_label
+        row_widget._timer = None
+        self.msg_sender_rows.append(row_widget)
+        self._save_can_tx_controls()
 
-    def __populate_signals(self, table: QTableWidget, sym_name: str):
+    def __populate_signals(self, table: QTableWidget, sym_name: str, preset_values: Dict = None):
         table.clearContents()
         table.setRowCount(0)
 
@@ -846,6 +956,14 @@ class SignalViewer(QMainWindow):
 
             edit = QLineEdit()
             edit.setObjectName(sig_name)
+            if isinstance(preset_values, dict):
+                try:
+                    sig_vals = preset_values.get("signals", {})
+                    if isinstance(sig_vals, dict) and sig_name in sig_vals:
+                        edit.setText(str(int(sig_vals[sig_name])))
+                except Exception:
+                    pass
+            edit.editingFinished.connect(self._save_can_tx_controls)
             table.setCellWidget(row, 1, edit)
 
             table.setRowHeight(row, row_height)
@@ -869,10 +987,20 @@ class SignalViewer(QMainWindow):
             row_widget._timer.stop()
             row_widget._timer.deleteLater()
 
+        if row_widget in self.msg_sender_rows:
+            self.msg_sender_rows.remove(row_widget)
         self.msg_rows_container.removeWidget(row_widget)
         row_widget.deleteLater()
+        self._save_can_tx_controls()
 
-    def __send_message(self, sym_name: str, table: QTableWidget, cyclic_val: str, row_widget: QWidget):
+    def __send_message(
+        self,
+        sym_name: str,
+        table: QTableWidget,
+        cyclic_val: str,
+        row_widget: QWidget,
+        persist: bool = True,
+    ):
         signals = {}
         if table and isinstance(table, QTableWidget):
             for row in range(table.rowCount()):
@@ -884,16 +1012,45 @@ class SignalViewer(QMainWindow):
                 except (ValueError, AttributeError):
                     signals[sig_name] = 0
 
-        cyclic_val = int(cyclic_val) if str(cyclic_val).isdigit() else 0
-        if cyclic_val > 0:
-            print(f"[Cyclic] Send {sym_name} every {cyclic_val}ms with {signals}")
-            timer = QTimer(row_widget)
-            timer.timeout.connect(lambda: self.frame_isct.send_signal_msg(signals, sym_name))
-            timer.start(cyclic_val)
-            row_widget._timer = timer
-        else:
-            print(f"[Once] Send {sym_name} with {signals}")
-            self.frame_isct.send_signal_msg(signals, sym_name)
+        print(f"[Once] Send {sym_name} with {signals}")
+        self.frame_isct.send_signal_msg(signals, sym_name)
+        if persist:
+            self._save_can_tx_controls()
+
+    def __toggle_cyclic_message(
+        self,
+        sym_name: str,
+        table: QTableWidget,
+        cyclic_val: str,
+        row_widget: QWidget,
+        btn_cyclic: QPushButton,
+        status_label: QLabel,
+    ):
+        current_timer = getattr(row_widget, "_timer", None)
+        if current_timer is not None:
+            current_timer.stop()
+            current_timer.deleteLater()
+            row_widget._timer = None
+            btn_cyclic.setText("Start Cyclic")
+            status_label.setText("stopped")
+            self._save_can_tx_controls()
+            return
+
+        ms = int(cyclic_val) if str(cyclic_val).isdigit() else 0
+        if ms <= 0:
+            print(f"[WARN] Invalid cyclic period '{cyclic_val}' for {sym_name}")
+            return
+
+        def _send_cb() -> None:
+            self.__send_message(sym_name, table, str(ms), row_widget, False)
+
+        timer = QTimer(row_widget)
+        timer.timeout.connect(_send_cb)
+        timer.start(ms)
+        row_widget._timer = timer
+        btn_cyclic.setText("Stop Cyclic")
+        status_label.setText(f"running {ms} ms")
+        self._save_can_tx_controls()
 
     # ----------------------- Sensors tab -----------------------
     def _build_sensors_tab(self):
@@ -916,28 +1073,38 @@ class SignalViewer(QMainWindow):
         self.tab_widget.addTab(w, "Sensors")
 
     def _refresh_sensors_values(self, f_sig_name, f_sig_val):
-        # update values from frame_isct
-        for r, key in enumerate(list(self.sensors.info.keys())):
-            sig_name = self.sensors.info[key].get("signal")
-            if f_sig_name == sig_name:
-                self.sensors_table.setItem(r, 2, QTableWidgetItem(f_sig_val))
+        row = self._sensor_row_by_signal.get(str(f_sig_name))
+        if row is None:
+            return
+        item = self.sensors_table.item(row, 2)
+        if item is None:
+            self.sensors_table.setItem(row, 2, QTableWidgetItem(str(f_sig_val)))
+        elif item.text() != str(f_sig_val):
+            item.setText(str(f_sig_val))
 
     def _refresh_actuators_get_values(self, f_sig_name, f_sig_val):
-        # update the get_sig column with live values
-        for r, key in enumerate(list(self.actuator.info.keys())):
-            get_sig = self.actuator.info[key].get("get_sig")
-            if get_sig == f_sig_name:
-                self.actuators_interface_table.setItem(r, 2, QTableWidgetItem(f_sig_val))
-            else:
-                set_sig = self.actuator.info[key].get("set_sig")
-                if set_sig == f_sig_name:
-                    self.actuators_interface_table.setItem(r, 1, QTableWidgetItem(f_sig_val))
+        row_get = self._act_get_row_by_signal.get(str(f_sig_name))
+        if row_get is not None:
+            item_get = self.actuators_interface_table.item(row_get, 2)
+            if item_get is None:
+                self.actuators_interface_table.setItem(row_get, 2, QTableWidgetItem(str(f_sig_val)))
+            elif item_get.text() != str(f_sig_val):
+                item_get.setText(str(f_sig_val))
+
+        row_set = self._act_set_row_by_signal.get(str(f_sig_name))
+        if row_set is not None:
+            item_set = self.actuators_interface_table.item(row_set, 1)
+            if item_set is None:
+                self.actuators_interface_table.setItem(row_set, 1, QTableWidgetItem(str(f_sig_val)))
+            elif item_set.text() != str(f_sig_val):
+                item_set.setText(str(f_sig_val))
     
 
     def _store_act_control_value(self, actuator_itf_key: str, text_val: str):
         s = text_val.strip()
         if not s:
-            raise ValueError("Valeur vide")
+            print(f"[WARN] Empty actuator value for {actuator_itf_key}, ignored")
+            return
 
         # 1) Entier signé décimal : -123, +42, 0
         try:
@@ -967,12 +1134,28 @@ class SignalViewer(QMainWindow):
             if neg:
                 val = -val
                 
-        # find the device 
+        matched_device = None
+        # Prefer strict prefix match: "<device>_<interface>"
         for key in self.act_control_values.keys():
-            if key in str(actuator_itf_key):
-                self.act_control_values[key][actuator_itf_key] = val
+            prefix = f"{key}_"
+            if str(actuator_itf_key).startswith(prefix):
+                matched_device = key
+                break
 
-        print(f"For device {key} interface {actuator_itf_key}, save {val}")
+        # Fallback for legacy naming variations.
+        if matched_device is None:
+            for key in self.act_control_values.keys():
+                if key in str(actuator_itf_key):
+                    matched_device = key
+                    break
+
+        if matched_device is None:
+            print(f"[WARN] No matching device found for actuator interface {actuator_itf_key}")
+            return
+
+        self.act_control_values[matched_device][actuator_itf_key] = val
+        self._save_act_controls()
+        print(f"For device {matched_device} interface {actuator_itf_key}, save {val}")
 
 
     # ----------------------- actuator device placeholders -----------------------
@@ -1070,36 +1253,169 @@ class SignalViewer(QMainWindow):
 
     def _save_act_controls(self):
         try:
+            os.makedirs(os.path.dirname(self.act_ctrl_path), exist_ok=True)
             with open(self.act_ctrl_path, 'w') as fh:
                 json.dump(self.act_control_values, fh, indent=2)
         except Exception as e:
             print(f"[WARN] Failed to save actuator controls: {e}")
 
     def _load_act_controls(self):
-        reset_json = False
-        if not os.path.isfile(self.act_ctrl_path):
-            return {key : {} for key in self.actuator.dvc_list}
+        default = {key: {} for key in self.actuator.dvc_list}
+        src_path = self.act_ctrl_path
+        if not os.path.isfile(src_path):
+            # Backward compatibility: old single-file location in IHM folder.
+            if os.path.isfile(self.legacy_act_ctrl_path):
+                src_path = self.legacy_act_ctrl_path
+            else:
+                return default
         try:
-            with open(self.act_ctrl_path, 'r') as fh:
+            with open(src_path, 'r') as fh:
                 store_value = json.load(fh)
-                
-                for interface in store_value.values():
-                    if reset_json:
-                        break
-
-                    for interface_id in interface.keys():
-                        if interface_id not in self.actuator.info.keys():
-                            reset_json = True
-                            break
         except Exception as e:
             print(f"[WARN] Failed to load actuator controls: {e}")
-            return {key : {} for key in self.actuator.dvc_list}
-        
-        if reset_json:
-            print("[WARNING] : act_interface change, reset to default")
-            return {key : {} for key in self.actuator.dvc_list}
-        else:
-            return store_value
+            return default
+
+        expected_devices = list(self.actuator.dvc_list)
+        valid_interfaces = set(self.actuator.info.keys())
+
+        # Start from default structure and merge only compatible persisted values.
+        loaded = {key: {} for key in expected_devices}
+        changed = False
+
+        if not isinstance(store_value, dict):
+            print("[WARNING] : invalid act_controls format, reset to default")
+            return loaded
+
+        for device_name, interfaces in store_value.items():
+            if device_name not in loaded:
+                changed = True
+                continue
+            if not isinstance(interfaces, dict):
+                changed = True
+                continue
+            for interface_id, value in interfaces.items():
+                if interface_id in valid_interfaces:
+                    try:
+                        loaded[device_name][interface_id] = int(value)
+                    except Exception:
+                        changed = True
+                else:
+                    changed = True
+
+        if changed:
+            print("[WARNING] : act_interface changed, keeping compatible persisted values")
+        if src_path != self.act_ctrl_path:
+            # Migrate legacy store to runtime/per-ECU file.
+            self.act_control_values = loaded
+            self._save_act_controls()
+
+        return loaded
+
+    def _collect_can_tx_rows_state(self):
+        rows = []
+        for row_widget in list(getattr(self, "msg_sender_rows", [])):
+            try:
+                combo = row_widget._combo
+                table = row_widget._sig_table
+                cyclic_edit = row_widget._cyclic_edit
+            except Exception:
+                continue
+
+            sym_name = combo.currentText() if combo is not None else ""
+            signals = {}
+            if table is not None:
+                for row in range(table.rowCount()):
+                    sig_item = table.item(row, 0)
+                    sig_name = sig_item.text().split(" ")[0] if sig_item else ""
+                    edit = table.cellWidget(row, 1)
+                    try:
+                        signals[sig_name] = int(edit.text())
+                    except Exception:
+                        signals[sig_name] = 0
+
+            cyc_raw = cyclic_edit.text() if cyclic_edit is not None else "0"
+            cyclic_ms = int(cyc_raw) if str(cyc_raw).isdigit() else 0
+            rows.append(
+                {
+                    "symbol": sym_name,
+                    "cyclic_ms": cyclic_ms,
+                    "cyclic_enabled": bool(getattr(row_widget, "_timer", None) is not None),
+                    "signals": signals,
+                }
+            )
+        return rows
+
+    def _save_can_tx_controls(self):
+        try:
+            os.makedirs(os.path.dirname(self.can_tx_cfg_path), exist_ok=True)
+            payload = {
+                "rows": self._collect_can_tx_rows_state()
+            }
+            with open(self.can_tx_cfg_path, "w") as fh:
+                json.dump(payload, fh, indent=2)
+        except Exception as e:
+            print(f"[WARN] Failed to save CAN TX controls: {e}")
+
+    def _load_can_tx_controls(self):
+        for row_widget in list(getattr(self, "msg_sender_rows", [])):
+            self.__delete_message_row(row_widget)
+
+        if not os.path.isfile(self.can_tx_cfg_path):
+            # Default row for fast first use.
+            self.__add_message_row(self.msg_symbol_picker.currentText(), None)
+            return
+
+        try:
+            with open(self.can_tx_cfg_path, "r") as fh:
+                payload = json.load(fh)
+        except Exception as e:
+            print(f"[WARN] Failed to load CAN TX controls: {e}")
+            self.__add_message_row(self.msg_symbol_picker.currentText(), None)
+            return
+
+        rows = payload.get("rows", []) if isinstance(payload, dict) else []
+        if not isinstance(rows, list) or len(rows) == 0:
+            self.__add_message_row(self.msg_symbol_picker.currentText(), None)
+            return
+
+        symbol_set = set(self.frame_isct.get_symbol_list())
+        for row_cfg in rows:
+            if not isinstance(row_cfg, dict):
+                continue
+            symbol = str(row_cfg.get("symbol", ""))
+            if symbol not in symbol_set and len(symbol_set) > 0:
+                continue
+            self.__add_message_row(symbol, row_cfg)
+            row_widget = self.msg_sender_rows[-1]
+            if bool(row_cfg.get("cyclic_enabled", False)):
+                try:
+                    self.__toggle_cyclic_message(
+                        row_widget._combo.currentText(),
+                        row_widget._sig_table,
+                        row_widget._cyclic_edit.text(),
+                        row_widget,
+                        row_widget._btn_cyclic,
+                        row_widget._status_label,
+                    )
+                except Exception:
+                    pass
+
+        if len(self.msg_sender_rows) == 0:
+            self.__add_message_row(self.msg_symbol_picker.currentText(), None)
+
+    def _reset_can_tx_controls(self):
+        for row_widget in list(getattr(self, "msg_sender_rows", [])):
+            self.__delete_message_row(row_widget)
+        self.__add_message_row(self.msg_symbol_picker.currentText(), None)
+        self._save_can_tx_controls()
+
+    def _persist_on_quit(self):
+        try:
+            self._save_graphs_state()
+            self._save_act_controls()
+            self._save_can_tx_controls()
+        except Exception as e:
+            print(f"[WARN] Failed to persist viewer state on quit: {e}")
         
 
     def __update_refresh_btn_color(self):
@@ -1155,6 +1471,7 @@ class SignalViewer(QMainWindow):
         self.previous_values = {signal_name: -1 for signal_name in self.signals_name}
 
         self._init_messages_tab()
+        self._init_message_sender_tab()
         self._init_sensors_tab()
         self._init_actuators_tab()
 
@@ -1163,6 +1480,7 @@ class SignalViewer(QMainWindow):
         # save graphs state and act controls on exit
         self._save_graphs_state()
         self._save_act_controls()
+        self._save_can_tx_controls()
         # kill all threads / cyclic
         try:
             self.kill_all_thread()

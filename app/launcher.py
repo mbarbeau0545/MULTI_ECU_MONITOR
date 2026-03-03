@@ -10,7 +10,7 @@ from .main_window import MultiEcuMonitorWindow
 
 def run() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="tools/multi_ecu_monitor/ecus_config.json")
+    parser.add_argument("--config", default=r"Doc\ConfigPrj\ecus_config.json")
     args = parser.parse_args()
 
     app = QApplication(sys.argv)

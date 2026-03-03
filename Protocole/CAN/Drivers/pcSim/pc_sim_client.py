@@ -12,7 +12,7 @@ class PcSimClient:
             sock.settimeout(self.timeout)
             sock.sendto(command.encode("ascii"), self.addr)
             try:
-                data, _ = sock.recvfrom(4096)
+                data, _ = sock.recvfrom(16384)
             except ConnectionResetError as exc:
                 # Windows UDP may raise WinError 10054 when peer is not ready.
                 raise TimeoutError(f"UDP peer reset while sending '{command}'") from exc
@@ -118,19 +118,38 @@ class PcSimClient:
         rsp = self._send(f"GET_ENC_SPEED {idx}")
         return float(self._parse_key_value(rsp, "VAL"))
 
+    def set_enc_map(self, idx: int, sig_pwm: int, pulses_per_revolution: float) -> str:
+        return self._send(f"SET_ENC_MAP {idx} {sig_pwm} {pulses_per_revolution}")
+
     def inject_can(self, node: int, can_id: int, payload: Iterable[int]) -> str:
+        return self.inject_can_ex(node, can_id, True, payload)
+
+    def inject_can_ex(self, node: int, can_id: int, is_extended: bool, payload: Iterable[int]) -> str:
         data: List[int] = [int(v) & 0xFF for v in payload]
         if len(data) > 8:
             raise ValueError("payload max length is 8")
         bytes_str = " ".join(str(v) for v in data)
-        return self._send(f"INJECT_CAN {node} {can_id} {len(data)} {bytes_str}")
+        ext_u8 = 1 if is_extended else 0
+        return self._send(f"INJECT_CAN_EX {node} {can_id} {ext_u8} {len(data)} {bytes_str}")
 
     def get_can_tx_count(self) -> int:
         rsp = self._send("GET_CAN_TX_COUNT")
         return int(self._parse_key_value(rsp, "COUNT"), 0)
 
+    def get_can_broker_tx_count(self) -> int:
+        rsp = self._send("GET_CAN_BROKER_TX_COUNT")
+        return int(self._parse_key_value(rsp, "COUNT"), 0)
+
+    def get_can_rx_reg_count(self) -> int:
+        rsp = self._send("GET_CAN_RX_REG_COUNT")
+        return int(self._parse_key_value(rsp, "COUNT"), 0)
+
     def clear_can_tx(self) -> int:
         rsp = self._send("CLEAR_CAN_TX")
+        return self._parse_rc(rsp)
+
+    def clear_can_broker_tx(self) -> int:
+        rsp = self._send("CLEAR_CAN_BROKER_TX")
         return self._parse_rc(rsp)
 
     def pop_can_tx(self) -> Optional[Dict[str, object]]:
@@ -157,3 +176,138 @@ class PcSimClient:
             "dlc": get_int("DLC"),
             "data": data,
         }
+
+    def pop_can_tx_burst(self, max_frames: int = 10) -> List[Dict[str, object]]:
+        if max_frames < 1:
+            return []
+        rsp = self._send(f"POP_CAN_TX_BURST {max_frames}")
+        rc = self._parse_rc(rsp)
+        if rc != 0:
+            return []
+
+        tokens = self._parse_tokens(rsp)
+        frames: List[Dict[str, object]] = []
+        idx = 0
+        while idx < len(tokens):
+            if tokens[idx] != "FRAME":
+                idx += 1
+                continue
+            # FRAME TS <ts> NODE <node> ID <id> EXT <ext> DLC <dlc> DATA <b0>..<bN-1>
+            if idx + 12 >= len(tokens):
+                break
+            if (tokens[idx + 1] != "TS"
+                or tokens[idx + 3] != "NODE"
+                or tokens[idx + 5] != "ID"
+                or tokens[idx + 7] != "EXT"
+                or tokens[idx + 9] != "DLC"
+                or tokens[idx + 11] != "DATA"):
+                idx += 1
+                continue
+
+            ts = int(tokens[idx + 2], 0)
+            node = int(tokens[idx + 4], 0)
+            can_id = int(tokens[idx + 6], 0)
+            is_ext = bool(int(tokens[idx + 8], 0))
+            dlc = int(tokens[idx + 10], 0)
+            if dlc < 0:
+                dlc = 0
+            data_start = idx + 12
+            data_end = min(len(tokens), data_start + dlc)
+            data = [int(tok, 0) & 0xFF for tok in tokens[data_start:data_end]]
+
+            frames.append(
+                {
+                    "timestamp_ms": ts,
+                    "node": node,
+                    "can_id": can_id,
+                    "is_extended": is_ext,
+                    "dlc": dlc,
+                    "data": data,
+                }
+            )
+            idx = data_end
+
+        return frames
+
+    def pop_can_broker_tx_burst(self, max_frames: int = 10) -> List[Dict[str, object]]:
+        if max_frames < 1:
+            return []
+        rsp = self._send(f"POP_CAN_BROKER_TX_BURST {max_frames}")
+        rc = self._parse_rc(rsp)
+        if rc != 0:
+            return []
+        # Same payload format as POP_CAN_TX_BURST
+        tokens = self._parse_tokens(rsp)
+        frames: List[Dict[str, object]] = []
+        idx = 0
+        while idx < len(tokens):
+            if tokens[idx] != "FRAME":
+                idx += 1
+                continue
+            if idx + 12 >= len(tokens):
+                break
+            if (tokens[idx + 1] != "TS"
+                or tokens[idx + 3] != "NODE"
+                or tokens[idx + 5] != "ID"
+                or tokens[idx + 7] != "EXT"
+                or tokens[idx + 9] != "DLC"
+                or tokens[idx + 11] != "DATA"):
+                idx += 1
+                continue
+            ts = int(tokens[idx + 2], 0)
+            node = int(tokens[idx + 4], 0)
+            can_id = int(tokens[idx + 6], 0)
+            is_ext = bool(int(tokens[idx + 8], 0))
+            dlc = int(tokens[idx + 10], 0)
+            if dlc < 0:
+                dlc = 0
+            data_start = idx + 12
+            data_end = min(len(tokens), data_start + dlc)
+            data = [int(tok, 0) & 0xFF for tok in tokens[data_start:data_end]]
+            frames.append(
+                {
+                    "timestamp_ms": ts,
+                    "node": node,
+                    "can_id": can_id,
+                    "is_extended": is_ext,
+                    "dlc": dlc,
+                    "data": data,
+                }
+            )
+            idx = data_end
+        return frames
+
+    def dump_can_rx_reg_burst(self, max_regs: int = 64) -> List[Dict[str, object]]:
+        if max_regs < 1:
+            return []
+        rsp = self._send(f"DUMP_CAN_RX_REG_BURST {max_regs}")
+        rc = self._parse_rc(rsp)
+        if rc != 0:
+            return []
+
+        tokens = self._parse_tokens(rsp)
+        regs: List[Dict[str, object]] = []
+        idx = 0
+        while idx < len(tokens):
+            if tokens[idx] != "REG":
+                idx += 1
+                continue
+            # REG NODE <node> ID <id> MASK <mask> EXT <ext>
+            if idx + 8 >= len(tokens):
+                break
+            if (tokens[idx + 1] != "NODE"
+                or tokens[idx + 3] != "ID"
+                or tokens[idx + 5] != "MASK"
+                or tokens[idx + 7] != "EXT"):
+                idx += 1
+                continue
+            regs.append(
+                {
+                    "node": int(tokens[idx + 2], 0),
+                    "can_id": int(tokens[idx + 4], 0),
+                    "mask": int(tokens[idx + 6], 0),
+                    "is_extended": bool(int(tokens[idx + 8], 0)),
+                }
+            )
+            idx += 9
+        return regs

@@ -118,8 +118,8 @@ class PcSimClient:
         rsp = self._send(f"GET_ENC_SPEED {idx}")
         return float(self._parse_key_value(rsp, "VAL"))
 
-    def set_enc_map(self, idx: int, sig_pwm: int, pulses_per_revolution: float) -> str:
-        return self._send(f"SET_ENC_MAP {idx} {sig_pwm} {pulses_per_revolution}")
+    def set_enc_map(self, idx: int, sig_pwm: int, pulses_per_revolution: float, sig_dir: int) -> str:
+        return self._send(f"SET_ENC_MAP {idx} {sig_pwm} {pulses_per_revolution} {sig_dir}")
 
     def inject_can(self, node: int, can_id: int, payload: Iterable[int]) -> str:
         return self.inject_can_ex(node, can_id, True, payload)

@@ -40,6 +40,7 @@ PLOT_MAX_POINT = 2000
 GRAPH_CONFIG_FILENAME = "graph_config.json"
 ACT_CTRL_FILENAME = "act_controls.json"
 CAN_TX_CFG_FILENAME = "can_tx_config.json"
+ECU_RX_TIMEOUT_SECONDS = 5.0
 # CAUTION : Automatic generated code section: Start #
 
 # CAUTION : Automatic generated code section: End #
@@ -103,6 +104,8 @@ class SignalViewer(QMainWindow):
         self._perf_samples_accum = 0
         self._perf_last_ts = time.time()
         self._perf_last_sps = 0.0
+        self._last_rx_activity_ts = time.time()
+        self._last_cyclic_rx_total = 0
         self.frame_isct.get_symbol_list()
 
         
@@ -126,8 +129,7 @@ class SignalViewer(QMainWindow):
         self.actuator = ActInfo(excel_path)
         self.act_control_values = self._load_act_controls()
 
-        self._init_sensors_tab()       # <-- crée et remplit l'onglet Sensors
-        self._init_actuators_tab()     # <-- crée et remplit l'onglet Actuators
+        self._init_sns_act_tab()
         # load persisted actuator controls
         # === Ajout du tab_widget comme contenu principal ===
         container = QWidget()
@@ -246,11 +248,26 @@ class SignalViewer(QMainWindow):
         try:
             self.frame_isct.perform_cyclic()
             self.is_ecu_connected = True
+            self._last_rx_activity_ts = time.time()
+            can_stats = self.frame_isct.get_can_runtime_stats()
+            self._last_cyclic_rx_total = int(can_stats.get("cyclic_rx_total", 0))
             print("[INFO] : Connection succeeded, ECU connected")
         except Exception as e:
             print(f"[INFO] : Connection Failed -> {e}")
             self.is_ecu_connected = False
 
+        self.__update_refresh_btn_color()
+
+    def __mark_ecu_disconnected(self, f_reason: str) -> None:
+        if not self.is_ecu_connected:
+            return
+        print(f"[WARNING] : ECU disconnected ({f_reason})")
+        self.is_ecu_connected = False
+        self.last_try_con = time.time()
+        try:
+            self.frame_isct.unperform_cyclic()
+        except Exception as e:
+            print(f"[WARN] Failed to stop cyclic after disconnect: {e}")
         self.__update_refresh_btn_color()
 
     #--------------------------
@@ -259,6 +276,15 @@ class SignalViewer(QMainWindow):
 
     def __refresh_table(self):
         curr_time = time.time()
+        can_stats = self.frame_isct.get_can_runtime_stats()
+        curr_cyclic_rx_total = int(can_stats.get("cyclic_rx_total", 0))
+        if curr_cyclic_rx_total > self._last_cyclic_rx_total:
+            self._last_cyclic_rx_total = curr_cyclic_rx_total
+            self._last_rx_activity_ts = curr_time
+
+        if self.is_ecu_connected and ((curr_time - self._last_rx_activity_ts) > ECU_RX_TIMEOUT_SECONDS):
+            self.__mark_ecu_disconnected(f"no CAN RX for {ECU_RX_TIMEOUT_SECONDS:.1f}s")
+
         if not self.is_ecu_connected and (curr_time - self.last_try_con) > 5:
             self.__connect_ecu()
             return
@@ -270,7 +296,6 @@ class SignalViewer(QMainWindow):
                 self._perf_last_sps = self._perf_samples_accum / (now - self._perf_last_ts) if (now - self._perf_last_ts) > 0.0 else 0.0
                 backlog = self.frame_isct.get_pending_msg_updates_count()
                 self.perf_label.setText(f"RX: {self._perf_last_sps:.1f} samp/s | backlog: {backlog}")
-                can_stats = self.frame_isct.get_can_runtime_stats()
                 self.can_count_label.setText(
                     f"CAN low_rx={can_stats['low_rx_total']} low_q={can_stats['low_queue_total']} "
                     f"cyc_rx={can_stats['cyclic_rx_total']} cyc_proc={can_stats['cyclic_processed_total']}"
@@ -278,6 +303,7 @@ class SignalViewer(QMainWindow):
                 self._perf_samples_accum = 0
                 self._perf_last_ts = now
             return
+        self._last_rx_activity_ts = curr_time
         self._perf_samples_accum += len(updates)
 
         latest_by_signal = {}
@@ -332,7 +358,6 @@ class SignalViewer(QMainWindow):
             backlog_after = self.frame_isct.get_pending_msg_updates_count()
             backlog = max(backlog_before, backlog_after)
             self.perf_label.setText(f"RX: {self._perf_last_sps:.1f} samp/s | backlog: {backlog}")
-            can_stats = self.frame_isct.get_can_runtime_stats()
             self.can_count_label.setText(
                 f"CAN low_rx={can_stats['low_rx_total']} low_q={can_stats['low_queue_total']} "
                 f"cyc_rx={can_stats['cyclic_rx_total']} cyc_proc={can_stats['cyclic_processed_total']}"
@@ -627,6 +652,107 @@ class SignalViewer(QMainWindow):
             btn.clicked.connect(lambda _, s=signal_name: self.__open_graph_tab(s))
             self.table.setCellWidget(row, 3, btn)
 
+
+    # ------------------------------
+    # SNS/ACT TAB
+    # ------------------------------
+    def _init_sns_act_tab(self):
+        """Initialise un onglet unique avec 2 colonnes:
+        - gauche: sensors (name, unit, value)
+        - droite: actuator interface (set/get/control) + devices (start/stop)
+        """
+        self.sns_act_widget = QWidget()
+        root_layout = QHBoxLayout(self.sns_act_widget)
+
+        splitter = QSplitter(Qt.Horizontal)
+        root_layout.addWidget(splitter)
+
+        # ---- Left column: Sensors ----
+        sensors_widget = QWidget()
+        sensors_layout = QVBoxLayout(sensors_widget)
+        sensors_layout.addWidget(QLabel("Sensors"))
+
+        self.sensors_table = QTableWidget()
+        self.sensors_table.setColumnCount(3)
+        self.sensors_table.setHorizontalHeaderLabels(["Sensor", "Unit", "Value"])
+        self.sensors_table.horizontalHeader().setStretchLastSection(True)
+        sensors_layout.addWidget(self.sensors_table)
+
+        keys = list(self.sensors.info.keys())
+        self._sensor_row_by_signal = {}
+        self.sensors_table.setRowCount(len(keys))
+        for row, key in enumerate(keys):
+            self.sensors_table.setItem(row, 0, QTableWidgetItem(key))
+            self.sensors_table.setItem(row, 1, QTableWidgetItem(self.sensors.info[key]["unity"]))
+
+            sig_name = self.sensors.info[key]["signal"]
+            self._sensor_row_by_signal[str(sig_name)] = row
+            val = self.frame_isct.get_signal_value(sig_name)
+            display_val = str(val[-1][1]) if val and val[-1] else "N/A"
+            self.sensors_table.setItem(row, 2, QTableWidgetItem(display_val))
+
+        splitter.addWidget(sensors_widget)
+
+        # ---- Right column: Actuator interface + devices ----
+        actuators_widget = QWidget()
+        actuators_layout = QVBoxLayout(actuators_widget)
+        actuators_layout.addWidget(QLabel("Actuators Interface"))
+
+        self.actuators_interface_table = QTableWidget()
+        self.actuators_interface_table.setColumnCount(4)
+        self.actuators_interface_table.setHorizontalHeaderLabels(
+            ["Actuator", "Set Value", "Get Value", "Control"]
+        )
+        self.actuators_interface_table.horizontalHeader().setStretchLastSection(True)
+        actuators_layout.addWidget(self.actuators_interface_table, 2)
+
+        keys = list(self.actuator.info.keys())
+        self._act_set_row_by_signal = {}
+        self._act_get_row_by_signal = {}
+        self.actuators_interface_table.setRowCount(len(keys))
+        for row, key in enumerate(keys):
+            info = self.actuator.info[key]
+            self.actuators_interface_table.setItem(row, 0, QTableWidgetItem(key))
+            self._act_set_row_by_signal[str(info["set_sig"])] = row
+            self._act_get_row_by_signal[str(info["get_sig"])] = row
+
+            val_set = self.frame_isct.get_signal_value(info["set_sig"])
+            val_get = self.frame_isct.get_signal_value(info["get_sig"])
+            self.actuators_interface_table.setItem(row, 1, QTableWidgetItem(str(val_set[-1][1]) if val_set and val_set[-1] else "N/A"))
+            self.actuators_interface_table.setItem(row, 2, QTableWidgetItem(str(val_get[-1][1]) if val_get and val_get[-1] else "N/A"))
+
+            edit_ctrl = QLineEdit()
+            edit_ctrl.setObjectName(key)
+            self.actuators_interface_table.setCellWidget(row, 3, edit_ctrl)
+            for actitf_dict in self.act_control_values.values():
+                if key in actitf_dict.keys():
+                    edit_ctrl.setText(str(actitf_dict[key]))
+            edit_ctrl.editingFinished.connect(lambda k=key, e=edit_ctrl: self._store_act_control_value(k, e.text()))
+
+        actuators_layout.addWidget(QLabel("Actuators Device"))
+
+        self.actuators_device_table = QTableWidget()
+        self.actuators_device_table.setColumnCount(3)
+        self.actuators_device_table.setHorizontalHeaderLabels(["Device", "Start", "Stop"])
+        self.actuators_device_table.horizontalHeader().setStretchLastSection(True)
+        actuators_layout.addWidget(self.actuators_device_table, 1)
+
+        dvc_list = self.actuator.dvc_list
+        self.actuators_device_table.setRowCount(len(dvc_list))
+        for row, dvc_name in enumerate(dvc_list):
+            self.actuators_device_table.setItem(row, 0, QTableWidgetItem(dvc_name))
+
+            btn_start = QPushButton("Start")
+            btn_start.clicked.connect(lambda _, d=dvc_name: self.send_act_dvc_values(d))
+            self.actuators_device_table.setCellWidget(row, 1, btn_start)
+
+            btn_stop = QPushButton("Stop")
+            btn_stop.clicked.connect(lambda _, d=dvc_name: self.stop_act_dvc(d))
+            self.actuators_device_table.setCellWidget(row, 2, btn_stop)
+
+        splitter.addWidget(actuators_widget)
+        splitter.setSizes([650, 950])
+        self.tab_widget.addTab(self.sns_act_widget, "sns/act")
 
     # ------------------------------
     # SENSORS TAB
@@ -1472,8 +1598,7 @@ class SignalViewer(QMainWindow):
 
         self._init_messages_tab()
         self._init_message_sender_tab()
-        self._init_sensors_tab()
-        self._init_actuators_tab()
+        self._init_sns_act_tab()
 
 
     def closeEvent(self, event):

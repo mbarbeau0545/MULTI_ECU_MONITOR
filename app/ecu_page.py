@@ -3,6 +3,7 @@ from pathlib import Path
 from PyQt5.QtWidgets import QLabel, QTabWidget, QVBoxLayout, QWidget
 
 from .config import AppMode, EcuConfig
+from .script_runner_tab import ScriptRunnerTab
 from .sil_io_tab import PcSimIoTab
 from .signalviewer_embed import EmbeddedSignalViewer
 
@@ -20,6 +21,7 @@ class EcuPage(QWidget):
         tabs = QTabWidget()
         if mode == AppMode.SIL:
             tabs.addTab(PcSimIoTab(ecu, refresh_ms=refresh_ms, cfg_path=cfg_path), "I/O")
+            tabs.addTab(ScriptRunnerTab(ecu, cfg_path=cfg_path), "Scripts")
 
         tabs.addTab(EmbeddedSignalViewer(ecu, mode), "SignalViewer")
         layout.addWidget(tabs, 1)

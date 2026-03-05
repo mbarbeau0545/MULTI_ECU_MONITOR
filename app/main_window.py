@@ -5,6 +5,7 @@ from PyQt5.QtWidgets import QLabel, QMainWindow, QTabWidget, QVBoxLayout, QWidge
 
 from .can_broker import PcSimCanBrokerService
 from .config import load_config
+from .detachable_tabs import DetachableTabManager
 from .ecu_page import EcuPage
 
 
@@ -31,6 +32,7 @@ class MultiEcuMonitorWindow(QMainWindow):
             layout.addWidget(warn_lbl)
 
         tabs = QTabWidget()
+        self._tabs_detacher = DetachableTabManager(tabs, self)
         if not self.cfg.ecus:
             layout.addWidget(QLabel("No active ECU in config (set enable_ecu=true or ecu_in_debug=true)."))
         else:

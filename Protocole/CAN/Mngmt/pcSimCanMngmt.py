@@ -258,7 +258,7 @@ class PcSimCanMngmt(CANInterface):
                 if len(msgs) > 0:
                     got_one = True
                 for msg in msgs:
-                    self._receive_queue.put(msg)
+                    self._queue_rx_item(msg)
                     self._stats["low_queue_total"] += 1
                     if self.enable_log:
                         try:

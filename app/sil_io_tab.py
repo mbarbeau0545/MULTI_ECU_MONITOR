@@ -65,6 +65,7 @@ class PcSimIoTab(QWidget):
         self.pwm_edits: List[QLineEdit] = []
         self.pwm_freq_edits: List[QLineEdit] = []
         self.in_dig_edits: List[QLineEdit] = []
+        self.in_evnt_pulse_ms_edits: List[QLineEdit] = []
         self.out_dig_edits: List[QLineEdit] = []
         self.in_freq_edits: List[QLineEdit] = []
         self.enc_abs_edits: List[QLineEdit] = []
@@ -112,10 +113,11 @@ class PcSimIoTab(QWidget):
 
         split_bottom = QSplitter()
         split_bottom.addWidget(self._build_in_dig_group())
+        split_bottom.addWidget(self._build_in_evnt_group())
         split_bottom.addWidget(self._build_out_dig_group())
         split_bottom.addWidget(self._build_in_freq_group())
         split_bottom.addWidget(self._build_encoder_group())
-        split_bottom.setSizes([240, 240, 240, 700])
+        split_bottom.setSizes([220, 300, 220, 220, 700])
         root.addWidget(split_bottom, 1)
 
     def _build_ana_group(self) -> QWidget:
@@ -195,6 +197,22 @@ class PcSimIoTab(QWidget):
             l.addWidget(bs, i, 2)
             l.addWidget(bg, i, 3)
             self.out_dig_edits.append(e)
+        return self._wrap(g)
+
+    def _build_in_evnt_group(self) -> QWidget:
+        g = QGroupBox("Input Event")
+        l = QGridLayout(g)
+        for i in range(self.counts.get("in_evnt", 0)):
+            e = QLineEdit("20")
+            btrig = QPushButton("Trigger Rising")
+            btrig.clicked.connect(lambda _=False, idx=i: self._trig_in_evnt(idx))
+            l.addWidget(QLabel(f"IN_EVNT[{i}]"), i, 0)
+            l.addWidget(e, i, 1)
+            l.addWidget(QLabel("pulse ms"), i, 2)
+            l.addWidget(btrig, i, 3)
+            self.in_evnt_pulse_ms_edits.append(e)
+        if self.counts.get("in_evnt", 0) == 0:
+            l.addWidget(QLabel("No input-event line available"), 0, 0, 1, 4)
         return self._wrap(g)
 
     def _build_in_freq_group(self) -> QWidget:
@@ -620,6 +638,11 @@ class PcSimIoTab(QWidget):
 
     def _get_in_dig(self, i: int) -> None:
         self.in_dig_edits[i].setText(str(self.client.get_in_dig(i)))
+
+    def _trig_in_evnt(self, i: int) -> None:
+        # Pulse width kept for UI consistency and possible future use.
+        _ = _to_int(self.in_evnt_pulse_ms_edits[i].text(), 20)
+        self.client.trigger_in_evnt(i)
 
     def _set_out_dig(self, i: int) -> None:
         self.client.set_out_dig(i, _to_int(self.out_dig_edits[i].text(), 0))

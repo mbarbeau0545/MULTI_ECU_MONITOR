@@ -122,6 +122,9 @@ class ScriptApiBackend:
     def set_in_dig(self, idx: int, value: int) -> None:
         self._client.set_in_dig(_as_int(idx), _as_int(value))
 
+    def trigger_in_evnt(self, idx: int) -> None:
+        self._client.trigger_in_evnt(_as_int(idx))
+
     def set_out_dig(self, idx: int, value: int) -> None:
         self._client.set_out_dig(_as_int(idx), _as_int(value))
 
@@ -495,6 +498,10 @@ def set_in_dig(idx: int, value: int) -> None:
     _api().set_in_dig(idx, value)
 
 
+def trigger_in_evnt(idx: int) -> None:
+    _api().trigger_in_evnt(idx)
+
+
 def set_out_dig(idx: int, value: int) -> None:
     _api().set_out_dig(idx, value)
 
@@ -594,6 +601,7 @@ __all__ = [
     "set_pwm",
     "set_pwm_freq",
     "set_in_dig",
+    "trigger_in_evnt",
     "set_out_dig",
     "set_in_freq",
     "set_enc_pos",

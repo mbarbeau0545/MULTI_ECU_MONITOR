@@ -266,7 +266,7 @@ class WaveshareCanMngmt(CANInterface):
 
             # Put a tuple to stay compatible with CANInterface.get_can_frame() signature,
             # but we override get_can_frame() below to return StructCANMsg directly.
-            self._receive_queue.put((msg, msg.timestamp))
+            self._queue_rx_item((msg, msg.timestamp))
 
             if self.enable_log and msg.length > 0:
                 try:

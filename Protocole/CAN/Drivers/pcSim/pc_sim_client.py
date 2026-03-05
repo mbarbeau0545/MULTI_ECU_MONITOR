@@ -88,6 +88,9 @@ class PcSimClient:
         rsp = self._send(f"GET_IN_DIG {idx}")
         return int(self._parse_key_value(rsp, "VAL"), 0)
 
+    def trigger_in_evnt(self, idx: int) -> str:
+        return self._send(f"TRIG_IN_EVNT {idx}")
+
     def set_out_dig(self, idx: int, value: int) -> str:
         return self._send(f"SET_OUT_DIG {idx} {value}")
 

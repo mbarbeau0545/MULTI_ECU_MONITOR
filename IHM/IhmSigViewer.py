@@ -1,4 +1,4 @@
-"""
+﻿"""
 #  @file        main.py
 #  @brief       Template_BriefDescription.
 #  @details     TemplateDetailsDescription.\n
@@ -31,6 +31,7 @@ from IHM.IhmSigPlayer import SignalPlayerWidget
 from Frame.frameMngmt import FrameMngmt
 from Signal.ActSnsMngmt import ActInfo, SnsInfo
 from typing import List, Dict
+from app.detachable_tabs import DetachableTabManager
 #------------------------------------------------------------------------------
 #                                       CONSTANT
 #------------------------------------------------------------------------------
@@ -40,6 +41,7 @@ PLOT_MAX_POINT = 2000
 GRAPH_CONFIG_FILENAME = "graph_config.json"
 ACT_CTRL_FILENAME = "act_controls.json"
 CAN_TX_CFG_FILENAME = "can_tx_config.json"
+ECU_RX_TIMEOUT_SECONDS = 5.0
 # CAUTION : Automatic generated code section: Start #
 
 # CAUTION : Automatic generated code section: End #
@@ -85,7 +87,7 @@ class SignalViewer(QMainWindow):
 
         self.signals_name = self.frame_isct.get_signal_list()
 
-        # utilisation de deque pour éviter l'écrasement
+        # utilisation de deque pour Ã©viter l'Ã©crasement
         self.signals_values = {
             signal_name: deque(maxlen=PLOT_MAX_POINT)
             for signal_name in self.signals_name
@@ -103,6 +105,8 @@ class SignalViewer(QMainWindow):
         self._perf_samples_accum = 0
         self._perf_last_ts = time.time()
         self._perf_last_sps = 0.0
+        self._last_rx_activity_ts = time.time()
+        self._last_cyclic_rx_total = 0
         self.frame_isct.get_symbol_list()
 
         
@@ -112,8 +116,10 @@ class SignalViewer(QMainWindow):
         # ========================
         self._create_toolbar()
 
-        # Création du QTabWidget
+        # CrÃ©ation du QTabWidget
         self.tab_widget = QTabWidget()
+        self._main_tabs_detacher = DetachableTabManager(self.tab_widget, self)
+        self._active_tab_kind = "unknown"
 
         # --- Messages tab (PCAN-Symbol style) ---
         self._init_messages_tab()
@@ -126,30 +132,31 @@ class SignalViewer(QMainWindow):
         self.actuator = ActInfo(excel_path)
         self.act_control_values = self._load_act_controls()
 
-        self._init_sensors_tab()       # <-- crée et remplit l'onglet Sensors
-        self._init_actuators_tab()     # <-- crée et remplit l'onglet Actuators
+        self._init_sns_act_tab()
         # load persisted actuator controls
         # === Ajout du tab_widget comme contenu principal ===
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.addWidget(self.tab_widget)
         self.setCentralWidget(container)
+        self.tab_widget.currentChanged.connect(self._on_main_tab_changed)
 
         # ========================
-        # Timers de mise à jour
+        # Timers de mise Ã  jour
         # ========================
         self.__connect_ecu()
         self.timer = QTimer()
         self.timer.timeout.connect(self.__refresh_table)
         self.timer.start(REFRESH_IMH_SECONDS)  # ms
 
-        # timer de garde (évite freeze de l’UI si pas de signal)
+        # timer de garde (Ã©vite freeze de lâ€™UI si pas de signal)
         self._timer_interrupt = QTimer()
         self._timer_interrupt.timeout.connect(lambda: None)
         self._timer_interrupt.start(REFRESH_IMH_SECONDS)
 
         # try to restore saved graphs
         self._load_graphs_state()
+        self._on_main_tab_changed(self.tab_widget.currentIndex())
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._persist_on_quit)
@@ -174,6 +181,45 @@ class SignalViewer(QMainWindow):
         if hasattr(self, "msg_signals_values") and f_sig_id in self.msg_signals_values:
             return self.msg_signals_values[f_sig_id]
         return self.signals_values.get(f_sig_id)
+
+    def _get_active_tab_kind(self) -> str:
+        curr = self.tab_widget.currentWidget()
+        if curr is None:
+            return "unknown"
+
+        if curr is getattr(self, "msg_sender_widget", None):
+            return "message_sender"
+        if curr is getattr(self, "msgs_widget", None):
+            return "messages"
+        if curr is getattr(self, "sns_act_widget", None):
+            return "sns_act"
+        if hasattr(curr, "_curves"):
+            return "graph"
+        return "other"
+
+    def _on_main_tab_changed(self, _index: int) -> None:
+        self._active_tab_kind = self._get_active_tab_kind()
+        self._update_graph_timers_state()
+
+    def _update_graph_timers_state(self) -> None:
+        curr = self.tab_widget.currentWidget()
+        pause_all_graphs = (self._active_tab_kind == "message_sender")
+
+        for i in range(self.tab_widget.count()):
+            w = self.tab_widget.widget(i)
+            t = getattr(w, "_timer", None)
+            if t is None:
+                continue
+            if not hasattr(w, "_curves"):
+                continue
+            is_current_graph = (w is curr) and (self._active_tab_kind == "graph")
+            should_run = (not pause_all_graphs) and is_current_graph and (not getattr(w, "_paused", False))
+            if should_run:
+                if not t.isActive():
+                    t.start(REFRESH_IMH_SECONDS)
+            else:
+                if t.isActive():
+                    t.stop()
 
 
     # ------------------------- toolbar -------------------------
@@ -246,11 +292,26 @@ class SignalViewer(QMainWindow):
         try:
             self.frame_isct.perform_cyclic()
             self.is_ecu_connected = True
+            self._last_rx_activity_ts = time.time()
+            can_stats = self.frame_isct.get_can_runtime_stats()
+            self._last_cyclic_rx_total = int(can_stats.get("cyclic_rx_total", 0))
             print("[INFO] : Connection succeeded, ECU connected")
         except Exception as e:
             print(f"[INFO] : Connection Failed -> {e}")
             self.is_ecu_connected = False
 
+        self.__update_refresh_btn_color()
+
+    def __mark_ecu_disconnected(self, f_reason: str) -> None:
+        if not self.is_ecu_connected:
+            return
+        print(f"[WARNING] : ECU disconnected ({f_reason})")
+        self.is_ecu_connected = False
+        self.last_try_con = time.time()
+        try:
+            self.frame_isct.unperform_cyclic()
+        except Exception as e:
+            print(f"[WARN] Failed to stop cyclic after disconnect: {e}")
         self.__update_refresh_btn_color()
 
     #--------------------------
@@ -259,18 +320,27 @@ class SignalViewer(QMainWindow):
 
     def __refresh_table(self):
         curr_time = time.time()
+        active_tab_kind = self._active_tab_kind
+        can_stats = self.frame_isct.get_can_runtime_stats()
+        curr_cyclic_rx_total = int(can_stats.get("cyclic_rx_total", 0))
+        if curr_cyclic_rx_total > self._last_cyclic_rx_total:
+            self._last_cyclic_rx_total = curr_cyclic_rx_total
+            self._last_rx_activity_ts = curr_time
+
+        if self.is_ecu_connected and ((curr_time - self._last_rx_activity_ts) > ECU_RX_TIMEOUT_SECONDS):
+            self.__mark_ecu_disconnected(f"no CAN RX for {ECU_RX_TIMEOUT_SECONDS:.1f}s")
+
         if not self.is_ecu_connected and (curr_time - self.last_try_con) > 5:
             self.__connect_ecu()
             return
         backlog_before = self.frame_isct.get_pending_msg_updates_count()
-        updates = self.frame_isct.get_pending_msg_updates(8000)
+        updates = self.frame_isct.get_pending_msg_updates(4000)
         if not updates:
             now = time.time()
             if (now - self._perf_last_ts) >= 0.5:
                 self._perf_last_sps = self._perf_samples_accum / (now - self._perf_last_ts) if (now - self._perf_last_ts) > 0.0 else 0.0
                 backlog = self.frame_isct.get_pending_msg_updates_count()
                 self.perf_label.setText(f"RX: {self._perf_last_sps:.1f} samp/s | backlog: {backlog}")
-                can_stats = self.frame_isct.get_can_runtime_stats()
                 self.can_count_label.setText(
                     f"CAN low_rx={can_stats['low_rx_total']} low_q={can_stats['low_queue_total']} "
                     f"cyc_rx={can_stats['cyclic_rx_total']} cyc_proc={can_stats['cyclic_processed_total']}"
@@ -278,6 +348,7 @@ class SignalViewer(QMainWindow):
                 self._perf_samples_accum = 0
                 self._perf_last_ts = now
             return
+        self._last_rx_activity_ts = curr_time
         self._perf_samples_accum += len(updates)
 
         latest_by_signal = {}
@@ -285,11 +356,33 @@ class SignalViewer(QMainWindow):
         for msg_id, signal_name, sample in updates:
             if not sample:
                 continue
-            sig_id = self._mk_sig_key(msg_id, signal_name)
-            if sig_id not in self.msg_signals_values:
-                self.msg_signals_values[sig_id] = deque(maxlen=PLOT_MAX_POINT)
-            self.msg_signals_values[sig_id].append(sample)
+            if signal_name in self.signals_values:
+                self.signals_values[signal_name].append(sample)
+            if active_tab_kind == "graph":
+                sig_id = self._mk_sig_key(msg_id, signal_name)
+                if sig_id not in self.msg_signals_values:
+                    self.msg_signals_values[sig_id] = deque(maxlen=PLOT_MAX_POINT)
+                self.msg_signals_values[sig_id].append(sample)
             latest_by_signal[(int(msg_id), str(signal_name))] = sample
+
+        update_messages = (active_tab_kind == "messages")
+        update_sns_act = (active_tab_kind == "sns_act")
+
+        if active_tab_kind == "message_sender":
+            now = time.time()
+            dt = now - self._perf_last_ts
+            if dt >= 0.5:
+                self._perf_last_sps = self._perf_samples_accum / dt if dt > 0.0 else 0.0
+                backlog_after = self.frame_isct.get_pending_msg_updates_count()
+                backlog = max(backlog_before, backlog_after)
+                self.perf_label.setText(f"RX: {self._perf_last_sps:.1f} samp/s | backlog: {backlog}")
+                self.can_count_label.setText(
+                    f"CAN low_rx={can_stats['low_rx_total']} low_q={can_stats['low_queue_total']} "
+                    f"cyc_rx={can_stats['cyclic_rx_total']} cyc_proc={can_stats['cyclic_processed_total']}"
+                )
+                self._perf_samples_accum = 0
+                self._perf_last_ts = now
+            return
 
         for msg_key, sample in latest_by_signal.items():
             if not sample:
@@ -300,7 +393,7 @@ class SignalViewer(QMainWindow):
             prev_raw = self.msg_previous_values.get(msg_key)
 
             # Update message tree item
-            if hasattr(self, '_sig_items') and msg_key in getattr(self, '_sig_items', {}):
+            if update_messages and hasattr(self, '_sig_items') and msg_key in getattr(self, '_sig_items', {}):
                 child: QTreeWidgetItem = self._sig_items[msg_key]
                 prev_calc_txt = child.data(1, Qt.DisplayRole)
                 prev_raw_txt = child.data(2, Qt.DisplayRole)
@@ -316,14 +409,11 @@ class SignalViewer(QMainWindow):
 
             self.msg_previous_values[msg_key] = raw_txt
 
-            if str(signal_name).upper().startswith("SNS"):
+            if update_sns_act and str(signal_name).upper().startswith("SNS"):
                 self._refresh_sensors_values(str(signal_name), calc_txt)
 
-            if str(signal_name).upper().startswith("ACT"):
+            if update_sns_act and str(signal_name).upper().startswith("ACT"):
                 self._refresh_actuators_get_values(str(signal_name), calc_txt)
-
-        # Ensure Sensors/Actuators always show latest values even when message backlog exists.
-        self._refresh_from_latest_cache()
 
         now = time.time()
         dt = now - self._perf_last_ts
@@ -332,7 +422,6 @@ class SignalViewer(QMainWindow):
             backlog_after = self.frame_isct.get_pending_msg_updates_count()
             backlog = max(backlog_before, backlog_after)
             self.perf_label.setText(f"RX: {self._perf_last_sps:.1f} samp/s | backlog: {backlog}")
-            can_stats = self.frame_isct.get_can_runtime_stats()
             self.can_count_label.setText(
                 f"CAN low_rx={can_stats['low_rx_total']} low_q={can_stats['low_queue_total']} "
                 f"cyc_rx={can_stats['cyclic_rx_total']} cyc_proc={can_stats['cyclic_processed_total']}"
@@ -404,6 +493,8 @@ class SignalViewer(QMainWindow):
         def update_plot():
             if widget._paused:
                 return
+            if self.tab_widget.currentWidget() is not widget:
+                return
 
             # init t0 commun
             if widget._t0 is None:
@@ -418,7 +509,7 @@ class SignalViewer(QMainWindow):
                 if widget._t0 is None:
                     return
 
-            # mise à jour par signal
+            # mise Ã  jour par signal
             for sig_name, sig_data in list(widget._curves.items()):
                 dq = self._get_plot_deque(sig_name)
                 if dq is None:
@@ -430,7 +521,13 @@ class SignalViewer(QMainWindow):
                         continue
 
                     try:
-                        t_sec = float(ts - widget._t0) / 1e9
+                        dt = float(ts - widget._t0)
+                        if widget._t0 >= 1e15:
+                            t_sec = dt / 1e9
+                        elif widget._t0 >= 1e12:
+                            t_sec = dt / 1e3
+                        else:
+                            t_sec = dt
                     except (TypeError, ValueError):
                         dq.popleft()
                         continue
@@ -451,7 +548,7 @@ class SignalViewer(QMainWindow):
                         sig_data["values"].append(y_val)
                     dq.popleft()
 
-                # découpe et affichage
+                # dÃ©coupe et affichage
                 if len(sig_data["times"]) > PLOT_MAX_POINT:
                     sig_data["times"] = sig_data["times"][-PLOT_MAX_POINT:]
                     sig_data["values"] = sig_data["values"][-PLOT_MAX_POINT:]
@@ -486,6 +583,7 @@ class SignalViewer(QMainWindow):
         widget._saved_tab_title = signal_name
 
         # when tab is closed via GUI we must save state
+        self._update_graph_timers_state()
         return widget
     # ------------------------------
     # SIGNALS TAB
@@ -629,6 +727,107 @@ class SignalViewer(QMainWindow):
 
 
     # ------------------------------
+    # SNS/ACT TAB
+    # ------------------------------
+    def _init_sns_act_tab(self):
+        """Initialise un onglet unique avec 2 colonnes:
+        - gauche: sensors (name, unit, value)
+        - droite: actuator interface (set/get/control) + devices (start/stop)
+        """
+        self.sns_act_widget = QWidget()
+        root_layout = QHBoxLayout(self.sns_act_widget)
+
+        splitter = QSplitter(Qt.Horizontal)
+        root_layout.addWidget(splitter)
+
+        # ---- Left column: Sensors ----
+        sensors_widget = QWidget()
+        sensors_layout = QVBoxLayout(sensors_widget)
+        sensors_layout.addWidget(QLabel("Sensors"))
+
+        self.sensors_table = QTableWidget()
+        self.sensors_table.setColumnCount(3)
+        self.sensors_table.setHorizontalHeaderLabels(["Sensor", "Unit", "Value"])
+        self.sensors_table.horizontalHeader().setStretchLastSection(True)
+        sensors_layout.addWidget(self.sensors_table)
+
+        keys = list(self.sensors.info.keys())
+        self._sensor_row_by_signal = {}
+        self.sensors_table.setRowCount(len(keys))
+        for row, key in enumerate(keys):
+            self.sensors_table.setItem(row, 0, QTableWidgetItem(key))
+            self.sensors_table.setItem(row, 1, QTableWidgetItem(self.sensors.info[key]["unity"]))
+
+            sig_name = self.sensors.info[key]["signal"]
+            self._sensor_row_by_signal[str(sig_name)] = row
+            val = self.frame_isct.get_signal_value(sig_name)
+            display_val = str(val[-1][1]) if val and val[-1] else "N/A"
+            self.sensors_table.setItem(row, 2, QTableWidgetItem(display_val))
+
+        splitter.addWidget(sensors_widget)
+
+        # ---- Right column: Actuator interface + devices ----
+        actuators_widget = QWidget()
+        actuators_layout = QVBoxLayout(actuators_widget)
+        actuators_layout.addWidget(QLabel("Actuators Interface"))
+
+        self.actuators_interface_table = QTableWidget()
+        self.actuators_interface_table.setColumnCount(4)
+        self.actuators_interface_table.setHorizontalHeaderLabels(
+            ["Actuator", "Set Value", "Get Value", "Control"]
+        )
+        self.actuators_interface_table.horizontalHeader().setStretchLastSection(True)
+        actuators_layout.addWidget(self.actuators_interface_table, 2)
+
+        keys = list(self.actuator.info.keys())
+        self._act_set_row_by_signal = {}
+        self._act_get_row_by_signal = {}
+        self.actuators_interface_table.setRowCount(len(keys))
+        for row, key in enumerate(keys):
+            info = self.actuator.info[key]
+            self.actuators_interface_table.setItem(row, 0, QTableWidgetItem(key))
+            self._act_set_row_by_signal[str(info["set_sig"])] = row
+            self._act_get_row_by_signal[str(info["get_sig"])] = row
+
+            val_set = self.frame_isct.get_signal_value(info["set_sig"])
+            val_get = self.frame_isct.get_signal_value(info["get_sig"])
+            self.actuators_interface_table.setItem(row, 1, QTableWidgetItem(str(val_set[-1][1]) if val_set and val_set[-1] else "N/A"))
+            self.actuators_interface_table.setItem(row, 2, QTableWidgetItem(str(val_get[-1][1]) if val_get and val_get[-1] else "N/A"))
+
+            edit_ctrl = QLineEdit()
+            edit_ctrl.setObjectName(key)
+            self.actuators_interface_table.setCellWidget(row, 3, edit_ctrl)
+            for actitf_dict in self.act_control_values.values():
+                if key in actitf_dict.keys():
+                    edit_ctrl.setText(str(actitf_dict[key]))
+            edit_ctrl.editingFinished.connect(lambda k=key, e=edit_ctrl: self._store_act_control_value(k, e.text()))
+
+        actuators_layout.addWidget(QLabel("Actuators Device"))
+
+        self.actuators_device_table = QTableWidget()
+        self.actuators_device_table.setColumnCount(3)
+        self.actuators_device_table.setHorizontalHeaderLabels(["Device", "Start", "Stop"])
+        self.actuators_device_table.horizontalHeader().setStretchLastSection(True)
+        actuators_layout.addWidget(self.actuators_device_table, 1)
+
+        dvc_list = self.actuator.dvc_list
+        self.actuators_device_table.setRowCount(len(dvc_list))
+        for row, dvc_name in enumerate(dvc_list):
+            self.actuators_device_table.setItem(row, 0, QTableWidgetItem(dvc_name))
+
+            btn_start = QPushButton("Start")
+            btn_start.clicked.connect(lambda _, d=dvc_name: self.send_act_dvc_values(d))
+            self.actuators_device_table.setCellWidget(row, 1, btn_start)
+
+            btn_stop = QPushButton("Stop")
+            btn_stop.clicked.connect(lambda _, d=dvc_name: self.stop_act_dvc(d))
+            self.actuators_device_table.setCellWidget(row, 2, btn_stop)
+
+        splitter.addWidget(actuators_widget)
+        splitter.setSizes([650, 950])
+        self.tab_widget.addTab(self.sns_act_widget, "sns/act")
+
+    # ------------------------------
     # SENSORS TAB
     # ------------------------------
     def _init_sensors_tab(self):
@@ -669,6 +868,7 @@ class SignalViewer(QMainWindow):
         layout = QVBoxLayout(self.actuators_widget)
 
         self.actuators_tab_widget = QTabWidget()
+        self._act_tabs_detacher = DetachableTabManager(self.actuators_tab_widget, self)
         layout.addWidget(self.actuators_tab_widget)
 
         # ---- Interface tab ----
@@ -735,7 +935,7 @@ class SignalViewer(QMainWindow):
         
     def __add_signal_to_tab(self, widget, signal_name: str):
         if signal_name in widget._curves:
-            return  # déjà présent
+            return  # dÃ©jÃ  prÃ©sent
         color = pg.intColor(len(widget._curves))  # couleur auto
         curve = widget._plot_widget.plot([], [], pen=color, name=signal_name)
         widget._curves[signal_name] = {
@@ -749,10 +949,46 @@ class SignalViewer(QMainWindow):
             widget._plot_widget.removeItem(widget._curves[signal_name]["curve"])
             del widget._curves[signal_name]
 
+    def __clone_graph_tab_here(self, src_widget):
+        src_idx = self.tab_widget.indexOf(src_widget)
+        if src_idx < 0:
+            return
+        src_title = self.tab_widget.tabText(src_idx)
+        src_signals = list(getattr(src_widget, "_curves", {}).keys())
+        new_title = f"{src_title}_copy"
+        if not src_signals:
+            src_signals = [new_title]
+        self.__open_graph_tab(new_title, saved_signals=src_signals)
+
+    def __clone_graph_tab_new_window(self, src_widget):
+        self.__clone_graph_tab_here(src_widget)
+        new_idx = self.tab_widget.count() - 1
+        if new_idx >= 0:
+            self._main_tabs_detacher.detach_tab(new_idx)
+
+    def __detach_graph_tab(self, src_widget):
+        src_idx = self.tab_widget.indexOf(src_widget)
+        if src_idx >= 0:
+            self._main_tabs_detacher.detach_tab(src_idx)
+
     def __show_graph_context_menu(self, widget, pos):
         menu = QMenu(widget)
 
-        # Signaux déjà affichés
+        action_open_here = QAction("Ouvrir une copie dans la fenetre actuelle", self)
+        action_open_here.triggered.connect(lambda: self.__clone_graph_tab_here(widget))
+        menu.addAction(action_open_here)
+
+        action_open_new_window = QAction("Ouvrir une copie dans une autre fenetre", self)
+        action_open_new_window.triggered.connect(lambda: self.__clone_graph_tab_new_window(widget))
+        menu.addAction(action_open_new_window)
+
+        action_detach_current = QAction("Detacher cet onglet graphique", self)
+        action_detach_current.triggered.connect(lambda: self.__detach_graph_tab(widget))
+        menu.addAction(action_detach_current)
+
+        menu.addSeparator()
+
+        # Signaux deja affiches
         if widget._curves:
             submenu_remove = menu.addMenu("Supprimer un signal")
             for sig_name in list(widget._curves.keys()):
@@ -762,7 +998,7 @@ class SignalViewer(QMainWindow):
                 )
                 submenu_remove.addAction(action)
 
-        # Signaux disponibles à ajouter
+        # Signaux disponibles a ajouter
         src = getattr(self, '_plot_signal_ids', self.signals_name)
         available = [s for s in src if s not in widget._curves]
         if available:
@@ -789,12 +1025,14 @@ class SignalViewer(QMainWindow):
 
             f_widget.deleteLater()
 
-            # mettre à jour le JSON
+            # mettre Ã  jour le JSON
             self._remove_tab_from_config(tab_title)
+            self._update_graph_timers_state()
 
     def __toggle_pause(self, f_widget, f_btn_toggle):
         f_widget._paused = not f_widget._paused
         f_btn_toggle.setText("Start" if f_widget._paused else "Stop")
+        self._update_graph_timers_state()
 
     #--------------------------
     # Message sender UI
@@ -1106,11 +1344,11 @@ class SignalViewer(QMainWindow):
             print(f"[WARN] Empty actuator value for {actuator_itf_key}, ignored")
             return
 
-        # 1) Entier signé décimal : -123, +42, 0
+        # 1) Entier signÃ© dÃ©cimal : -123, +42, 0
         try:
             val = int(s, 10)
         except ValueError:
-            # 2) Hexadécimal : accepte "0x1A", "1A", "-0x1A", "-1A"
+            # 2) HexadÃ©cimal : accepte "0x1A", "1A", "-0x1A", "-1A"
             neg = False
             t = s
 
@@ -1128,7 +1366,7 @@ class SignalViewer(QMainWindow):
                 val = int(t, 16)
             except ValueError as e:
                 raise ValueError(
-                    f"Valeur invalide: attendu un entier signé décimal ou un hexadécimal, reçu {text_val!r}"
+                    f"Valeur invalide: attendu un entier signÃ© dÃ©cimal ou un hexadÃ©cimal, reÃ§u {text_val!r}"
                 ) from e
 
             if neg:
@@ -1219,13 +1457,13 @@ class SignalViewer(QMainWindow):
             except FileNotFoundError:
                 tabs_state = []
 
-            # Filtrer en excluant l'onglet supprimé
+            # Filtrer en excluant l'onglet supprimÃ©
             new_tabs = [
                 t for t in tabs_state
                 if t.get("title") != tab_title
             ]
 
-            # Sauvegarder la config nettoyée
+            # Sauvegarder la config nettoyÃ©e
             with open(self.graph_cfg_path, 'w') as fh:
                 json.dump(new_tabs, fh, indent=2)
 
@@ -1247,6 +1485,7 @@ class SignalViewer(QMainWindow):
                 # if paused, flip paused flag
                 if tab.get('paused', False):
                     widget._paused = True
+            self._update_graph_timers_state()
             print(f"[INFO] Graph state restored from {self.graph_cfg_path}")
         except Exception as e:
             print(f"[WARN] Failed to restore graph state: {e}")
@@ -1452,7 +1691,7 @@ class SignalViewer(QMainWindow):
             print(f"[WARN] Failed to update config.json: {e}")
 
     def __reload_all(self):
-        """Fonction qui détruit et recrée toutes les tables, onglets et signaux"""
+        """Fonction qui dÃ©truit et recrÃ©e toutes les tables, onglets et signaux"""
         # On ferme les onglets graphiques
         for i in reversed(range(self.tab_widget.count())):
             w = self.tab_widget.widget(i)
@@ -1462,7 +1701,7 @@ class SignalViewer(QMainWindow):
         # Reload frame_isct avec le nouveau f_prj_cfg
         self.frame_isct = FrameMngmt(self.f_prj_cfg)
 
-        # Recréation des onglets Messages, Sensors et Actuators
+        # RecrÃ©ation des onglets Messages, Sensors et Actuators
         self.signals_name = self.frame_isct.get_signal_list()
         self.signals_values = {
             signal_name: deque(maxlen=PLOT_MAX_POINT)
@@ -1472,8 +1711,7 @@ class SignalViewer(QMainWindow):
 
         self._init_messages_tab()
         self._init_message_sender_tab()
-        self._init_sensors_tab()
-        self._init_actuators_tab()
+        self._init_sns_act_tab()
 
 
     def closeEvent(self, event):
@@ -1522,4 +1760,5 @@ if __name__ == '__main__':
     @params[out]
     @retval
 """
+
 

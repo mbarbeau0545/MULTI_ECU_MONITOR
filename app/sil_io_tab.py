@@ -29,6 +29,7 @@ from .fmkio_parser import parse_fmkio_counts
 _PI = math.pi
 _TWO_PI = 2.0 * math.pi
 _MRAD_PER_RAD = 1000.0
+_ECU_LINK_TIMEOUT_S = 5.0
 
 
 def _to_int(text: str, default: int = 0) -> int:
@@ -64,6 +65,7 @@ class PcSimIoTab(QWidget):
         self.pwm_edits: List[QLineEdit] = []
         self.pwm_freq_edits: List[QLineEdit] = []
         self.in_dig_edits: List[QLineEdit] = []
+        self.in_evnt_pulse_ms_edits: List[QLineEdit] = []
         self.out_dig_edits: List[QLineEdit] = []
         self.in_freq_edits: List[QLineEdit] = []
         self.enc_abs_edits: List[QLineEdit] = []
@@ -75,6 +77,11 @@ class PcSimIoTab(QWidget):
         self.encoder_runtime_state: Dict[int, Dict[str, float]] = {}
 
         self.tick_lbl = QLabel("-")
+        self.ecu_link_lbl = QLabel("ECU link: connecting...")
+        self.ecu_link_lbl.setStyleSheet("color: #666;")
+        self._ecu_online = False
+        self._last_ecu_msg_ts = time.monotonic()
+        self._offline_warned = False
 
         self._build_ui()
         self._load_encoder_modes_from_cfg()
@@ -91,6 +98,7 @@ class PcSimIoTab(QWidget):
         top = QHBoxLayout()
         top.addWidget(QLabel("PC_SIM tick"))
         top.addWidget(self.tick_lbl)
+        top.addWidget(self.ecu_link_lbl)
         btn_refresh = QPushButton("Refresh")
         btn_refresh.clicked.connect(self._refresh_once)
         top.addWidget(btn_refresh)
@@ -105,10 +113,11 @@ class PcSimIoTab(QWidget):
 
         split_bottom = QSplitter()
         split_bottom.addWidget(self._build_in_dig_group())
+        split_bottom.addWidget(self._build_in_evnt_group())
         split_bottom.addWidget(self._build_out_dig_group())
         split_bottom.addWidget(self._build_in_freq_group())
         split_bottom.addWidget(self._build_encoder_group())
-        split_bottom.setSizes([240, 240, 240, 700])
+        split_bottom.setSizes([220, 300, 220, 220, 700])
         root.addWidget(split_bottom, 1)
 
     def _build_ana_group(self) -> QWidget:
@@ -190,6 +199,22 @@ class PcSimIoTab(QWidget):
             self.out_dig_edits.append(e)
         return self._wrap(g)
 
+    def _build_in_evnt_group(self) -> QWidget:
+        g = QGroupBox("Input Event")
+        l = QGridLayout(g)
+        for i in range(self.counts.get("in_evnt", 0)):
+            e = QLineEdit("20")
+            btrig = QPushButton("Trigger Rising")
+            btrig.clicked.connect(lambda _=False, idx=i: self._trig_in_evnt(idx))
+            l.addWidget(QLabel(f"IN_EVNT[{i}]"), i, 0)
+            l.addWidget(e, i, 1)
+            l.addWidget(QLabel("pulse ms"), i, 2)
+            l.addWidget(btrig, i, 3)
+            self.in_evnt_pulse_ms_edits.append(e)
+        if self.counts.get("in_evnt", 0) == 0:
+            l.addWidget(QLabel("No input-event line available"), 0, 0, 1, 4)
+        return self._wrap(g)
+
     def _build_in_freq_group(self) -> QWidget:
         g = QGroupBox("Input Freq")
         l = QGridLayout(g)
@@ -258,8 +283,11 @@ class PcSimIoTab(QWidget):
         return s
 
     def _refresh_once(self) -> None:
+        now_s = time.monotonic()
+        got_reply = False
         try:
             parts = self.client.get_all().split()
+            got_reply = True
             if "TICK" in parts:
                 self.tick_lbl.setText(parts[parts.index("TICK") + 1])
             if "ANA" in parts and "PWM" in parts:
@@ -274,7 +302,41 @@ class PcSimIoTab(QWidget):
         except Exception:
             pass
 
+        if got_reply:
+            self._last_ecu_msg_ts = now_s
+            if not self._ecu_online:
+                self._ecu_online = True
+                self._offline_warned = False
+                self.ecu_link_lbl.setText("ECU link: online")
+                self.ecu_link_lbl.setStyleSheet("color: #008000;")
+                self._on_ecu_reconnected()
+        elif (now_s - self._last_ecu_msg_ts) >= _ECU_LINK_TIMEOUT_S:
+            if self._ecu_online:
+                self._ecu_online = False
+            self.ecu_link_lbl.setText("ECU link: offline (no reply > 5s)")
+            self.ecu_link_lbl.setStyleSheet("color: #b00020;")
+            if not self._offline_warned:
+                print(f"[WARNING] [{self.ecu.name}] ECU link timeout (> {_ECU_LINK_TIMEOUT_S:.1f}s without reply)")
+                self._offline_warned = True
+
         self._step_encoder_modes()
+
+    def _on_ecu_reconnected(self) -> None:
+        self._apply_encoder_mappings_to_runtime()
+        for idx in range(self.counts.get("enc", 0)):
+            cfg = self._default_encoder_mode_cfg(idx)
+            cfg.update(self.encoder_mode_cfg.get(idx, {}))
+            mode = str(cfg.get("mode", "manual"))
+            if mode in ("manual", "encdr_based_pulse"):
+                continue
+            pos_rad = _wrap_to_pi(float(self.encoder_runtime_state[idx].get("pos", 0.0)))
+            speed_rad_s = _to_float(self.enc_speed_edits[idx].text(), 0.0)
+            try:
+                self.client.set_enc_pos(idx, pos_rad * _MRAD_PER_RAD, pos_rad * _MRAD_PER_RAD)
+                self.client.set_enc_speed(idx, speed_rad_s * _MRAD_PER_RAD)
+            except Exception:
+                pass
+        print(f"[INFO] [{self.ecu.name}] ECU reconnected, encoder mapping reapplied")
 
     @staticmethod
     def _set_text_if_not_editing(edit: QLineEdit, value: str) -> None:
@@ -366,6 +428,7 @@ class PcSimIoTab(QWidget):
             "sin_offset": 0.0,
             "sin_period_s": 4.0,
             "sig_pwm": idx,
+            "sig_dir": idx,
             "pulses_per_revolution": 3200.0,
         }
 
@@ -389,7 +452,10 @@ class PcSimIoTab(QWidget):
         cfg = self.encoder_mode_cfg.get(idx, self._default_encoder_mode_cfg(idx))
         mode = str(cfg.get("mode", "manual"))
         if mode == "encdr_based_pulse":
-            text = f"mode={mode} pwm={cfg.get('sig_pwm', idx)} ppr={cfg.get('pulses_per_revolution', 3200.0)}"
+            text = (
+                f"mode={mode} pwm={cfg.get('sig_pwm', idx)} dir={cfg.get('sig_dir', idx)} "
+                f"ppr={cfg.get('pulses_per_revolution', 3200.0)}"
+            )
         else:
             text = f"mode={mode}"
         lbl = self.enc_cfg_summary_lbls.get(idx)
@@ -430,9 +496,10 @@ class PcSimIoTab(QWidget):
             cfg = self._default_encoder_mode_cfg(idx)
             cfg.update(self.encoder_mode_cfg.get(idx, {}))
             sig_pwm = int(cfg.get("sig_pwm", idx))
+            sig_dir = int(cfg.get("sig_dir", idx))
             ppr = float(cfg.get("pulses_per_revolution", 3200.0))
             try:
-                self.client.set_enc_map(idx, sig_pwm, ppr)
+                self.client.set_enc_map(idx, sig_pwm, ppr, sig_dir)
             except Exception:
                 pass
 
@@ -454,6 +521,7 @@ class PcSimIoTab(QWidget):
         sin_offset = QLineEdit(str(current.get("sin_offset", 0.0)))
         sin_period = QLineEdit(str(current.get("sin_period_s", 4.0)))
         sig_pwm = QLineEdit(str(current.get("sig_pwm", idx)))
+        sig_dir = QLineEdit(str(current.get("sig_dir", idx)))
         ppr = QLineEdit(str(current.get("pulses_per_revolution", 3200.0)))
 
         found = mode.findText(str(current.get("mode", "manual")))
@@ -477,15 +545,17 @@ class PcSimIoTab(QWidget):
         layout.addWidget(sin_period, 5, 1, 1, 2)
         layout.addWidget(QLabel("sig_pwm"), 6, 0)
         layout.addWidget(sig_pwm, 6, 1)
-        layout.addWidget(QLabel("pulses_per_revolution"), 6, 2)
-        layout.addWidget(ppr, 6, 3)
+        layout.addWidget(QLabel("sig_dir"), 6, 2)
+        layout.addWidget(sig_dir, 6, 3)
+        layout.addWidget(QLabel("pulses_per_revolution"), 7, 0)
+        layout.addWidget(ppr, 7, 1, 1, 3)
 
         btn_save = QPushButton("Save")
         btn_reset = QPushButton("Reset Default")
         btn_cancel = QPushButton("Cancel")
-        layout.addWidget(btn_save, 7, 1)
-        layout.addWidget(btn_reset, 7, 2)
-        layout.addWidget(btn_cancel, 7, 3)
+        layout.addWidget(btn_save, 8, 1)
+        layout.addWidget(btn_reset, 8, 2)
+        layout.addWidget(btn_cancel, 8, 3)
 
         def build_cfg() -> Dict[str, object]:
             return {
@@ -499,6 +569,7 @@ class PcSimIoTab(QWidget):
                 "sin_offset": _to_float(sin_offset.text(), 0.0),
                 "sin_period_s": _to_float(sin_period.text(), 4.0),
                 "sig_pwm": _to_int(sig_pwm.text(), idx),
+                "sig_dir": _to_int(sig_dir.text(), idx),
                 "pulses_per_revolution": _to_float(ppr.text(), 3200.0),
             }
 
@@ -513,6 +584,7 @@ class PcSimIoTab(QWidget):
             sin_offset.setText(str(cfg.get("sin_offset", 0.0)))
             sin_period.setText(str(cfg.get("sin_period_s", 4.0)))
             sig_pwm.setText(str(cfg.get("sig_pwm", idx)))
+            sig_dir.setText(str(cfg.get("sig_dir", idx)))
             ppr.setText(str(cfg.get("pulses_per_revolution", 3200.0)))
 
         def on_save() -> None:
@@ -567,6 +639,11 @@ class PcSimIoTab(QWidget):
     def _get_in_dig(self, i: int) -> None:
         self.in_dig_edits[i].setText(str(self.client.get_in_dig(i)))
 
+    def _trig_in_evnt(self, i: int) -> None:
+        # Pulse width kept for UI consistency and possible future use.
+        _ = _to_int(self.in_evnt_pulse_ms_edits[i].text(), 20)
+        self.client.trigger_in_evnt(i)
+
     def _set_out_dig(self, i: int) -> None:
         self.client.set_out_dig(i, _to_int(self.out_dig_edits[i].text(), 0))
 
@@ -579,7 +656,18 @@ class PcSimIoTab(QWidget):
     def _get_in_freq(self, i: int) -> None:
         self.in_freq_edits[i].setText(f"{self.client.get_in_freq(i)}")
 
+    def _force_encoder_manual_mode(self, i: int) -> None:
+        cfg = self._default_encoder_mode_cfg(i)
+        cfg.update(self.encoder_mode_cfg.get(i, {}))
+        mode = str(cfg.get("mode", "manual"))
+        if mode != "manual":
+            cfg["mode"] = "manual"
+            self.encoder_mode_cfg[i] = cfg
+            self._refresh_encoder_cfg_summary(i)
+            print(f"[INFO] [{self.ecu.name}] ENC[{i}] switched to manual mode after direct set")
+
     def _set_enc_pos(self, i: int) -> None:
+        self._force_encoder_manual_mode(i)
         abs_rad = _wrap_to_pi(_to_float(self.enc_abs_edits[i].text(), 0.0))
         rel_rad = _wrap_to_pi(_to_float(self.enc_rel_edits[i].text(), 0.0))
         self.client.set_enc_pos(i, abs_rad * _MRAD_PER_RAD, rel_rad * _MRAD_PER_RAD)
@@ -596,6 +684,7 @@ class PcSimIoTab(QWidget):
         self.encoder_runtime_state[i]["pos"] = rel_rad
 
     def _set_enc_speed(self, i: int) -> None:
+        self._force_encoder_manual_mode(i)
         speed_rad_s = _to_float(self.enc_speed_edits[i].text(), 0.0)
         self.client.set_enc_speed(i, speed_rad_s * _MRAD_PER_RAD)
         self.enc_speed_edits[i].setText(f"{speed_rad_s:.6f}")

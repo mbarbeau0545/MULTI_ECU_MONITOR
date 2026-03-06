@@ -427,6 +427,9 @@ class FrameMngmt():
         extract raw bufer from can & serial and interpret data to put it 
         into sig_values
         """
+        # Ensure no legacy cyclic threads keep running before starting new ones.
+        self.unperform_cyclic()
+
         if self._is_serial_enable:
             self._serial_istc.open_serial_line()
             self._serial_istc.configure_reception(f_nbByte=self._srl_frame_len)
@@ -467,13 +470,31 @@ class FrameMngmt():
     def unperform_cyclic(self)->None:
         """Unperform cyclic frame analyzer
         """
+        self._stop_srl_thread.set()
+        self._stop_can_thread.set()
+
         if self._is_serial_enable:
-            self._serial_istc.stop()
-            self._stop_srl_thread.set()
+            try:
+                self._serial_istc.stop()
+            except Exception:
+                pass
 
         if self._is_can_enable:
-            self._can_istc.receive_queue_stop()
-            self._can_istc.disconnect()
+            try:
+                self._can_istc.receive_queue_stop()
+            except Exception:
+                pass
+            try:
+                self._can_istc.disconnect()
+            except Exception:
+                pass
+
+        if self._srl_frame_thread is not None and self._srl_frame_thread.is_alive():
+            self._srl_frame_thread.join(timeout=1.0)
+        if self._can_frame_thread is not None and self._can_frame_thread.is_alive():
+            self._can_frame_thread.join(timeout=1.0)
+        self._srl_frame_thread = None
+        self._can_frame_thread = None
     #--------------------------
     # _cyclic_serial_frame
     #--------------------------

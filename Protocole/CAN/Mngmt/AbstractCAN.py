@@ -30,7 +30,7 @@ from Library.ModuleLog import MngLogFile, log
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 from threading import Thread,Event
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 
 #-------------------------------------------------------------------
 #                     Constants
@@ -108,7 +108,8 @@ class CANInterface(ABC):
         self.enable_log = kwargs.get('canlogging', False)
         self.error_cb_mngmt = kwargs.get('error_cb', self.default_error_handler)
         self.is_init = False
-        self._receive_queue: Queue = Queue()
+        # Bounded RX queue to avoid unbounded memory growth if UI/consumer lags.
+        self._receive_queue: Queue = Queue(maxsize=8192)
         self._rx_thread: Optional[Thread] = None
         self._stop_rx_thread = Event()
         self._stats = {
@@ -201,6 +202,23 @@ class CANInterface(ABC):
     #------------------------     
     def default_error_handler(self, status):
         print(f'[ERROR] : Can Error code -> {status}')
+
+    #------------------------
+    # _queue_rx_item
+    #------------------------
+    def _queue_rx_item(self, f_item) -> None:
+        """Push one item in RX queue, dropping oldest on overflow."""
+        try:
+            self._receive_queue.put_nowait(f_item)
+        except Full:
+            try:
+                self._receive_queue.get_nowait()
+            except Empty:
+                pass
+            try:
+                self._receive_queue.put_nowait(f_item)
+            except Full:
+                pass
 
     #------------------------
     # @_can_reader_cyclic

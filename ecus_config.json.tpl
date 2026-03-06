@@ -28,7 +28,10 @@
           "ramp_rate": 200.0,
           "sin_amp": 500.0,
           "sin_offset": 0.0,
-          "sin_period_s": 4.0
+          "sin_period_s": 4.0,
+          "sig_pwm": 0,
+          "sig_dir": 0,
+          "pulses_per_revolution": 3200.0
         }
       ],
       "can_gate": "PCSIM",
@@ -70,7 +73,10 @@
           "ramp_rate": 200.0,
           "sin_amp": 500.0,
           "sin_offset": 0.0,
-          "sin_period_s": 4.0
+          "sin_period_s": 4.0,
+          "sig_pwm": 0,
+          "sig_dir": 0,
+          "pulses_per_revolution": 3200.0
         }
       ],
       "can_gate": "PCSIM",
@@ -112,7 +118,10 @@
           "ramp_rate": 200.0,
           "sin_amp": 500.0,
           "sin_offset": 0.0,
-          "sin_period_s": 4.0
+          "sin_period_s": 4.0,
+          "sig_pwm": 0,
+          "sig_dir": 0,
+          "pulses_per_revolution": 3200.0
         }
       ],
       "can_gate": "PCSIM",
@@ -154,7 +163,10 @@
           "ramp_rate": 200.0,
           "sin_amp": 500.0,
           "sin_offset": 0.0,
-          "sin_period_s": 4.0
+          "sin_period_s": 4.0,
+          "sig_pwm": 0,
+          "sig_dir": 0,
+          "pulses_per_revolution": 3200.0
         }
       ],
       "can_gate": "PCSIM",
@@ -181,3 +193,4 @@
     }
   ]
 }
+

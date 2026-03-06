@@ -58,7 +58,7 @@ def _count_prefixed_items(content: str, prefix: str) -> int:
 
 
 def parse_fmkio_counts(path: Path) -> Dict[str, int]:
-    counts = {"ana": 0, "pwm": 0, "in_dig": 0, "out_dig": 0, "in_freq": 0, "enc": 0}
+    counts = {"ana": 0, "pwm": 0, "in_dig": 0, "in_evnt": 0, "out_dig": 0, "in_freq": 0, "enc": 0}
     try:
         content = path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
@@ -67,6 +67,7 @@ def parse_fmkio_counts(path: Path) -> Dict[str, int]:
     counts["ana"] = _count_from_enum_nb(content, "FMKIO_INPUT_SIGANA_NB")
     counts["pwm"] = _count_from_enum_nb(content, "FMKIO_OUTPUT_SIGPWM_NB")
     counts["in_dig"] = _count_from_enum_nb(content, "FMKIO_INPUT_SIGDIG_NB")
+    counts["in_evnt"] = _count_from_enum_nb(content, "FMKIO_INPUT_SIGEVNT_NB")
     counts["out_dig"] = _count_from_enum_nb(content, "FMKIO_OUTPUT_SIGDIG_NB")
     counts["in_freq"] = _count_from_enum_nb(content, "FMKIO_INPUT_SIGFREQ_NB")
     counts["enc"] = _count_from_enum_nb(content, "FMKIO_INPUT_ENCODER_NB")
@@ -77,6 +78,8 @@ def parse_fmkio_counts(path: Path) -> Dict[str, int]:
         counts["pwm"] = _count_prefixed_items(content, "FMKIO_OUTPUT_SIGPWM_")
     if counts["in_dig"] == 0:
         counts["in_dig"] = _count_prefixed_items(content, "FMKIO_INPUT_SIGDIG_")
+    if counts["in_evnt"] == 0:
+        counts["in_evnt"] = _count_prefixed_items(content, "FMKIO_INPUT_SIGEVNT_")
     if counts["out_dig"] == 0:
         counts["out_dig"] = _count_prefixed_items(content, "FMKIO_OUTPUT_SIGDIG_")
     if counts["in_freq"] == 0:

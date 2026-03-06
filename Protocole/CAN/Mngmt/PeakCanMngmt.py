@@ -205,7 +205,7 @@ class PeakCanMngmt(CANInterface):
 
             if result == PCAN_ERROR_OK:
                 last_time_rec = current_time
-                self._receive_queue.put((msg, timestamp))
+                self._queue_rx_item((msg, timestamp))
 
                 if self.enable_log:
                     cnt_buff_log += 1

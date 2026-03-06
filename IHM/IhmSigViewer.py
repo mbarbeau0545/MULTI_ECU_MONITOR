@@ -356,6 +356,8 @@ class SignalViewer(QMainWindow):
         for msg_id, signal_name, sample in updates:
             if not sample:
                 continue
+            if signal_name in self.signals_values:
+                self.signals_values[signal_name].append(sample)
             if active_tab_kind == "graph":
                 sig_id = self._mk_sig_key(msg_id, signal_name)
                 if sig_id not in self.msg_signals_values:
@@ -519,7 +521,13 @@ class SignalViewer(QMainWindow):
                         continue
 
                     try:
-                        t_sec = float(ts - widget._t0) / 1e9
+                        dt = float(ts - widget._t0)
+                        if widget._t0 >= 1e15:
+                            t_sec = dt / 1e9
+                        elif widget._t0 >= 1e12:
+                            t_sec = dt / 1e3
+                        else:
+                            t_sec = dt
                     except (TypeError, ValueError):
                         dq.popleft()
                         continue

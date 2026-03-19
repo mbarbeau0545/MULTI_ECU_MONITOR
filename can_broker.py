@@ -15,7 +15,7 @@ def main() -> int:
     cfg = load_config(Path(args.config).resolve())
     broker = PcSimCanBrokerService(cfg)
     if not broker.is_enabled:
-        print("[INFO] CAN broker disabled by config or not enough PCSIM ECUs")
+        print("[INFO] CAN broker disabled by config or no active PCSIM ECU")
         return 0
 
     stop = {"v": False}

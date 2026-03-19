@@ -40,10 +40,25 @@ class EcuConfig:
 
 
 @dataclass
+class CanClientConfig:
+    name: str
+    udp: UdpConfig
+    enable_client: bool = True
+    can_gate: str = "PCSIM"
+    pcsim_timeout_s: Optional[float] = None
+    pcsim_poll_sleep_s: Optional[float] = None
+    pcsim_max_pop_per_cycle: Optional[int] = None
+    pcsim_clear_can_tx_on_connect: Optional[bool] = None
+    pcsim_shared_can_nodes: List[int] = field(default_factory=list)
+    pcsim_rx_filters: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class MonitorConfig:
     mode: AppMode
     refresh_ms: int
     ecus: List[EcuConfig]
+    can_clients: List[CanClientConfig] = field(default_factory=list)
     can_broker_enabled: bool = False
     can_broker_control_port: int = 19600
     can_broker_poll_sleep_s: float = 0.001
@@ -86,11 +101,14 @@ def _validate_monitor_cfg(cfg: MonitorConfig) -> Tuple[List[str], List[str]]:
     if cfg.can_broker_max_inject_per_cycle < 1:
         errors.append("general.can_broker.max_inject_per_cycle must be >= 1")
 
-    if not cfg.ecus:
-        warnings.append("No active ECU in 'ecus' (enable_ecu=false and ecu_in_debug=false for all)")
+    if not cfg.ecus and not cfg.can_clients:
+        warnings.append(
+            "No active endpoint in config ('ecus' disabled and no enabled 'can_clients')."
+        )
         return errors, warnings
 
     allowed_can_gates = {"PCSIM", "PEAK", "WAVESHARE"}
+    allowed_client_can_gates = {"PCSIM"}
     names_seen = set()
     pcsim_endpoints = set()
     pcsim_enabled_count = 0
@@ -154,8 +172,48 @@ def _validate_monitor_cfg(cfg: MonitorConfig) -> Tuple[List[str], List[str]]:
                 f"{pfx}: mode SIL with can_gate={ecu.can_gate}; I/O tab uses PCSIM UDP and may not match CAN transport"
             )
 
-    if cfg.can_broker_enabled and pcsim_enabled_count < 2:
-        warnings.append("general.can_broker.enabled=true but fewer than 2 PCSIM ECUs are enabled")
+    for idx, client in enumerate(cfg.can_clients):
+        pfx = f"can_clients[{idx}] ({client.name})"
+        if not client.name.strip():
+            errors.append(f"{pfx}: name is empty")
+        if client.name in names_seen:
+            errors.append(f"{pfx}: duplicate endpoint name '{client.name}'")
+        names_seen.add(client.name)
+
+        if not client.udp.host.strip():
+            errors.append(f"{pfx}: udp.host is empty")
+        if client.udp.port < 1 or client.udp.port > 65535:
+            errors.append(f"{pfx}: udp.port out of range [1..65535]: {client.udp.port}")
+        if client.udp.timeout_s <= 0.0:
+            errors.append(f"{pfx}: udp.timeout_s must be > 0")
+        if client.udp.node < 0:
+            errors.append(f"{pfx}: udp.node must be >= 0")
+
+        if client.can_gate not in allowed_client_can_gates:
+            errors.append(
+                f"{pfx}: can_gate '{client.can_gate}' invalid (allowed for can_clients: {sorted(allowed_client_can_gates)})"
+            )
+
+        if client.pcsim_timeout_s is not None and client.pcsim_timeout_s <= 0.0:
+            errors.append(f"{pfx}: pcsim_timeout_s must be > 0")
+        if client.pcsim_poll_sleep_s is not None and client.pcsim_poll_sleep_s < 0.0:
+            errors.append(f"{pfx}: pcsim_poll_sleep_s must be >= 0")
+        if client.pcsim_max_pop_per_cycle is not None and client.pcsim_max_pop_per_cycle < 1:
+            errors.append(f"{pfx}: pcsim_max_pop_per_cycle must be >= 1")
+        for node in client.pcsim_shared_can_nodes:
+            if int(node) < 0:
+                errors.append(f"{pfx}: pcsim_shared_can_nodes contains invalid node {node}")
+                break
+
+        if client.can_gate == "PCSIM":
+            pcsim_enabled_count += 1
+            endpoint = (client.udp.host, client.udp.port)
+            if endpoint in pcsim_endpoints:
+                errors.append(f"{pfx}: duplicate PCSIM UDP endpoint {client.udp.host}:{client.udp.port}")
+            pcsim_endpoints.add(endpoint)
+
+    if cfg.can_broker_enabled and pcsim_enabled_count < 1:
+        warnings.append("general.can_broker.enabled=true but no active PCSIM endpoint is configured")
 
     return errors, warnings
 
@@ -252,10 +310,55 @@ def load_config(cfg_path: Path) -> MonitorConfig:
             )
         )
 
+    can_clients: List[CanClientConfig] = []
+    for raw in data.get("can_clients", []):
+        if not isinstance(raw, dict):
+            continue
+        enabled = _as_bool(raw.get("enable_client", raw.get("enabled", True)), True)
+        if not enabled:
+            continue
+
+        udp_raw = raw.get("udp", {}) if isinstance(raw, dict) else {}
+        udp = UdpConfig(
+            host=str(udp_raw.get("host", "127.0.0.1")),
+            port=int(udp_raw.get("port", 19090)),
+            timeout_s=float(udp_raw.get("timeout_s", 0.4)),
+            node=int(udp_raw.get("node", 0)),
+        )
+        pcsim_can = raw.get("pcsim_can")
+        if not isinstance(pcsim_can, dict):
+            pcsim_can = {}
+        shared_nodes_raw = pcsim_can.get("shared_can_nodes", [])
+        if isinstance(shared_nodes_raw, list):
+            shared_nodes = [int(v) for v in shared_nodes_raw]
+        else:
+            shared_nodes = []
+        rx_filters_raw = pcsim_can.get("rx_filters", [])
+        if not isinstance(rx_filters_raw, list):
+            rx_filters_raw = []
+
+        can_clients.append(
+            CanClientConfig(
+                name=str(raw.get("name", "CAN_CLIENT")),
+                udp=udp,
+                enable_client=enabled,
+                can_gate=str(raw.get("can_gate", "PCSIM")).upper(),
+                pcsim_timeout_s=float(pcsim_can["timeout_s"]) if "timeout_s" in pcsim_can else None,
+                pcsim_poll_sleep_s=float(pcsim_can["poll_sleep_s"]) if "poll_sleep_s" in pcsim_can else None,
+                pcsim_max_pop_per_cycle=int(pcsim_can["max_pop_per_cycle"]) if "max_pop_per_cycle" in pcsim_can else None,
+                pcsim_clear_can_tx_on_connect=_as_bool(pcsim_can.get("clear_can_tx_on_connect"), True)
+                if "clear_can_tx_on_connect" in pcsim_can
+                else None,
+                pcsim_shared_can_nodes=shared_nodes,
+                pcsim_rx_filters=[dict(v) for v in rx_filters_raw if isinstance(v, dict)],
+            )
+        )
+
     cfg = MonitorConfig(
         mode=mode,
         refresh_ms=refresh_ms,
         ecus=ecus,
+        can_clients=can_clients,
         can_broker_enabled=_as_bool(can_broker_raw.get("enabled", False), False),
         can_broker_control_port=int(can_broker_raw.get("control_port", 19600)),
         can_broker_poll_sleep_s=float(can_broker_raw.get("poll_sleep_s", 0.001)),

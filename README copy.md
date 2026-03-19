@@ -56,5 +56,5 @@ Si `rx_filters` est vide, le broker utilise les abonnements RX reels exposes par
 ## Notes runtime
 
 - La barre de statut affiche l'etat broker: `rx`, `routed`, `injected`, `dropped`, `cycle`, `err`.
-- Le broker ne s'active que si `general.can_broker.enabled=true` et au moins 2 ECU PCSIM actifs.
+- Le broker ne s'active que si `general.can_broker.enabled=true` et au moins 1 ECU PCSIM actif.
 - Si le monitor est demarre apres le `.bat`, il detecte le broker externe et ne cree pas de doublon.

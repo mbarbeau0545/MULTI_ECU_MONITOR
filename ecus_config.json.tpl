@@ -191,6 +191,28 @@
         "rx_filters": []
       }
     }
+  ],
+  "can_clients": [
+    {
+      "name": "TOOL_LOGGER",
+      "enable_client": false,
+      "can_gate": "PCSIM",
+      "pcsim_can": {
+        "shared_can_nodes": [
+          0,
+          2,
+          3,
+          4
+        ],
+        "rx_filters": []
+      },
+      "udp": {
+        "host": "127.0.0.1",
+        "port": 19110,
+        "timeout_s": 0.5,
+        "node": 0
+      }
+    }
   ]
 }
 

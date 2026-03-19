@@ -962,7 +962,9 @@ class FrameMngmt():
                         # Nouveau bloc : CycleTime
                         if line.strip().lower().startswith("cycletime="):
                             cycle_val = int(line.strip().split("=")[1].strip())
-                            if current_symbol and (current_read == 'SEND' or current_read == 'SENDRECEIVE') :
+                            if current_symbol and (
+                                self.symbol[current_symbol]['msg_direction'] == 'SEND'\
+                                      or self.symbol[current_symbol]['msg_direction'] == 'SENDRECEIVE') :
                                 if cycle_val == 0:
                                     raise ValueError(f"CycleTime cannot be 0 for symbol '{current_symbol}'")
                                 self.symbol[current_symbol]['cycle_time'] = int(cycle_val)

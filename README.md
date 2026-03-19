@@ -12,6 +12,7 @@ Le mode SIL peut maintenant lancer un **broker CAN central** qui connecte tous l
   - filtres statiques JSON (`pcsim_can.rx_filters`), ou
   - abonnements reels de l'exe (`DUMP_CAN_RX_REG_BURST`) si aucun filtre statique.
 - Le broker injecte ensuite la trame vers les ECU abonnes (`INJECT_CAN_EX`).
+- Des clients non-ECU peuvent etre ajoutes via `can_clients[]` (PCSIM UDP).
 
 Important: la file `POP_CAN_TX_BURST` historique est conservee pour les viewers/IHM et n'est plus consommee par le broker.
 
@@ -44,6 +45,32 @@ Sous `pcsim_can`:
 
 Si `rx_filters` est vide, le broker utilise les abonnements RX reels exposes par l'exe.
 
+### Clients CAN externes (optionnel)
+
+Bloc top-level `can_clients`:
+
+```json
+"can_clients": [
+  {
+    "name": "TOOL_LOGGER",
+    "enable_client": true,
+    "can_gate": "PCSIM",
+    "pcsim_can": {
+      "shared_can_nodes": [0, 2, 3, 4],
+      "rx_filters": []
+    },
+    "udp": {
+      "host": "127.0.0.1",
+      "port": 19110,
+      "timeout_s": 0.5,
+      "node": 0
+    }
+  }
+]
+```
+
+Le client doit implementer les commandes UDP PCSIM broker (`CLEAR_CAN_BROKER_TX`, `POP_CAN_BROKER_TX_BURST`, `DUMP_CAN_RX_REG_BURST`, `INJECT_CAN_EX`).
+
 ## Lancement
 
 - Multi monitor: `python tools/MultiEcuMonitor/multi_ecu_monitor.py --config Doc/ConfigPrj/ecus_config.json`
@@ -56,5 +83,5 @@ Si `rx_filters` est vide, le broker utilise les abonnements RX reels exposes par
 ## Notes runtime
 
 - La barre de statut affiche l'etat broker: `rx`, `routed`, `injected`, `dropped`, `cycle`, `err`.
-- Le broker ne s'active que si `general.can_broker.enabled=true` et au moins 2 ECU PCSIM actifs.
+- Le broker ne s'active que si `general.can_broker.enabled=true` et au moins 1 endpoint PCSIM actif (ECU ou `can_client`).
 - Si le monitor est demarre apres le `.bat`, il detecte le broker externe et ne cree pas de doublon.

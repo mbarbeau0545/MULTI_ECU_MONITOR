@@ -54,7 +54,7 @@ class EmbeddedSignalViewer(QWidget):
             "can_cfg": {
                 "is_enable": True,
                 "gate": "PCSIM",
-                "can_speed_bps": 500000,
+                "can_speed_bps": 250000,
                 "device_port": {
                     "host": self.ecu.udp.host,
                     "port": self.ecu.udp.port,

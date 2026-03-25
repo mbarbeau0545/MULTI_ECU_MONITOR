@@ -69,6 +69,24 @@ def _resolve(base: Path, value: str) -> Path:
     return (base / p).resolve()
 
 
+def _validate_waveshare_device_port(
+    value: Optional[Dict[str, Any]],
+    pfx: str,
+    errors: List[str],
+) -> None:
+    if not isinstance(value, dict):
+        errors.append(f"{pfx}: can_device_port is required for WAVESHARE and must be an object")
+        return
+
+    vid = value.get("Vid", value.get("vid"))
+    pid = value.get("Pid", value.get("pid"))
+
+    if not isinstance(vid, str) or not vid.strip():
+        errors.append(f"{pfx}: can_device_port.Vid is required for WAVESHARE")
+    if not isinstance(pid, str) or not pid.strip():
+        errors.append(f"{pfx}: can_device_port.Pid is required for WAVESHARE")
+
+
 def _validate_monitor_cfg(cfg: MonitorConfig) -> Tuple[List[str], List[str]]:
     errors: List[str] = []
     warnings: List[str] = []
@@ -131,6 +149,9 @@ def _validate_monitor_cfg(cfg: MonitorConfig) -> Tuple[List[str], List[str]]:
 
         if ecu.can_speed_bps <= 0:
             errors.append(f"{pfx}: can_speed_bps must be > 0")
+
+        if ecu.can_gate == "WAVESHARE":
+            _validate_waveshare_device_port(ecu.can_device_port, pfx, errors)
 
         if ecu.pcsim_timeout_s is not None and ecu.pcsim_timeout_s <= 0.0:
             errors.append(f"{pfx}: pcsim_timeout_s must be > 0")

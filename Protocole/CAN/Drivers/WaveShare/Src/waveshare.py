@@ -187,13 +187,13 @@ class UsbCanAdapter:
 
         cmd_frame.append(0xaa)
         cmd_frame.append(0x55)
-        cmd_frame.append(0x12)
+        cmd_frame.append(0x02) # fix len protocol
 
         cmd_frame.append(self.speed.value)
         cmd_frame.append(frame.value)
         cmd_frame.extend([0] * 8)  # Fill with zeros for Filter ID and Mask ID (not handled)
         cmd_frame.append(mode.value)
-        cmd_frame.extend([0x01, 0, 0, 0, 0])
+        cmd_frame.extend([0x00, 0, 0, 0, 0])
         cmd_frame.append(self.generate_checksum(cmd_frame[2:19]))
 
         if self.frame_send(cmd_frame) < 0:

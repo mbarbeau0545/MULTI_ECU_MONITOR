@@ -41,7 +41,7 @@ PLOT_MAX_POINT = 2000
 GRAPH_CONFIG_FILENAME = "graph_config.json"
 ACT_CTRL_FILENAME = "act_controls.json"
 CAN_TX_CFG_FILENAME = "can_tx_config.json"
-ECU_RX_TIMEOUT_SECONDS = 5.0
+ECU_RX_TIMEOUT_SECONDS = 800000
 # CAUTION : Automatic generated code section: Start #
 
 # CAUTION : Automatic generated code section: End #

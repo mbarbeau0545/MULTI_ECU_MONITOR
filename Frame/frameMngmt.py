@@ -38,8 +38,12 @@ PATTERN_SIGNAL = re.compile(
     r"(?:\s+/e:(\w+))?"                                  # enum
 )
 
+# Expressions régulières nécessaires
 PATTERN_SYM_ID = re.compile(
-    r'ID=([0-9A-Fa-f]+)h\s*//\s*(\w+)\s*(.*)'
+    r'ID=([0-9A-Fa-f]+)h'
+    r'(?:\s*//\s*(\w+)\s*(.*?))?'
+    r'(?:\s*--\s*(ON_CHANGE|FORCE))?'
+    r'\s*$'
 )
 SYM_PATTERN_LEN = re.compile(r'Len=(\d+)')
 SYM_PATTERN_SIG = re.compile(r'Sig=(\w+)\s+(\d+)')
@@ -916,6 +920,7 @@ class FrameMngmt():
                         if match_id:
                             current_id = match_id.group(1)
                             current_type = match_id.group(2)
+                            current_policy = match_id.group(4) if match_id.group(4) else 'DEFAULT'
 
                             if current_type not in self.list_id:
                                 self.list_id[current_type] = []
@@ -928,6 +933,7 @@ class FrameMngmt():
                             if current_symbol:
                                 self.symbol[current_symbol]['msg_id'] = int(current_id,16)
                                 self.symbol[current_symbol]['msg_type'] = current_type
+                                self.symbol[current_symbol]['tx_policy'] = current_policy
                                 # multi ecu managment 
                                 if match_id.group(3) != "":
                                     multi_msg_dir = []
@@ -962,9 +968,8 @@ class FrameMngmt():
                         # Nouveau bloc : CycleTime
                         if line.strip().lower().startswith("cycletime="):
                             cycle_val = int(line.strip().split("=")[1].strip())
-                            if current_symbol and (
-                                self.symbol[current_symbol]['msg_direction'] == 'SEND'\
-                                      or self.symbol[current_symbol]['msg_direction'] == 'SENDRECEIVE') :
+                            if current_symbol and (self.symbol[current_symbol]['msg_direction'] == 'SEND'\
+                                                   or self.symbol[current_symbol]['msg_direction'] == 'SENDRECEIVE') :
                                 if cycle_val == 0:
                                     raise ValueError(f"CycleTime cannot be 0 for symbol '{current_symbol}'")
                                 self.symbol[current_symbol]['cycle_time'] = int(cycle_val)

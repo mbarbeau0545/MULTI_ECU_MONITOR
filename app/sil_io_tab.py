@@ -100,7 +100,7 @@ class PcSimIoTab(QWidget):
         top.addWidget(self.tick_lbl)
         top.addWidget(self.ecu_link_lbl)
         btn_refresh = QPushButton("Refresh")
-        btn_refresh.clicked.connect(self._refresh_once)
+        btn_refresh.clicked.connect(self._on_refresh_clicked)
         top.addWidget(btn_refresh)
         top.addStretch(1)
         root.addLayout(top)
@@ -321,8 +321,12 @@ class PcSimIoTab(QWidget):
 
         self._step_encoder_modes()
 
+    def _on_refresh_clicked(self) -> None:
+        self._refresh_once()
+        self._push_encoder_cfg_to_runtime("manual refresh")
+
     def _on_ecu_reconnected(self) -> None:
-        self._apply_encoder_mappings_to_runtime()
+        self._push_encoder_cfg_to_runtime("ecu reconnected")
         for idx in range(self.counts.get("enc", 0)):
             cfg = self._default_encoder_mode_cfg(idx)
             cfg.update(self.encoder_mode_cfg.get(idx, {}))
@@ -336,7 +340,7 @@ class PcSimIoTab(QWidget):
                 self.client.set_enc_speed(idx, speed_rad_s * _MRAD_PER_RAD)
             except Exception:
                 pass
-        print(f"[INFO] [{self.ecu.name}] ECU reconnected, encoder mapping reapplied")
+        print(f"[INFO] [{self.ecu.name}] ECU reconnected, encoder mapping/state reapplied")
 
     @staticmethod
     def _set_text_if_not_editing(edit: QLineEdit, value: str) -> None:
@@ -502,6 +506,10 @@ class PcSimIoTab(QWidget):
                 self.client.set_enc_map(idx, sig_pwm, ppr, sig_dir)
             except Exception:
                 pass
+
+    def _push_encoder_cfg_to_runtime(self, reason: str) -> None:
+        self._apply_encoder_mappings_to_runtime()
+        print(f"[INFO] [{self.ecu.name}] Encoder cfg sent to runtime ({reason})")
 
     def _open_encoder_cfg_dialog(self, idx: int) -> None:
         current = self._default_encoder_mode_cfg(idx)

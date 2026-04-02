@@ -45,10 +45,6 @@ class CanClientConfig:
     udp: UdpConfig
     enable_client: bool = True
     can_gate: str = "PCSIM"
-    pcsim_timeout_s: Optional[float] = None
-    pcsim_poll_sleep_s: Optional[float] = None
-    pcsim_max_pop_per_cycle: Optional[int] = None
-    pcsim_clear_can_tx_on_connect: Optional[bool] = None
     pcsim_shared_can_nodes: List[int] = field(default_factory=list)
     pcsim_rx_filters: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -64,6 +60,7 @@ class MonitorConfig:
     can_broker_poll_sleep_s: float = 0.001
     can_broker_max_pop_per_ecu: int = 128
     can_broker_max_inject_per_cycle: int = 2048
+    can_broker_log_rules: Dict[str, List[str]] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
 
@@ -84,6 +81,24 @@ def _resolve(base: Path, value: str) -> Path:
     return (base / p).resolve()
 
 
+def _validate_waveshare_device_port(
+    value: Optional[Dict[str, Any]],
+    pfx: str,
+    errors: List[str],
+) -> None:
+    if not isinstance(value, dict):
+        errors.append(f"{pfx}: can_device_port is required for WAVESHARE and must be an object")
+        return
+
+    vid = value.get("Vid", value.get("vid"))
+    pid = value.get("Pid", value.get("pid"))
+
+    if not isinstance(vid, str) or not vid.strip():
+        errors.append(f"{pfx}: can_device_port.Vid is required for WAVESHARE")
+    if not isinstance(pid, str) or not pid.strip():
+        errors.append(f"{pfx}: can_device_port.Pid is required for WAVESHARE")
+
+
 def _validate_monitor_cfg(cfg: MonitorConfig) -> Tuple[List[str], List[str]]:
     errors: List[str] = []
     warnings: List[str] = []
@@ -100,15 +115,24 @@ def _validate_monitor_cfg(cfg: MonitorConfig) -> Tuple[List[str], List[str]]:
         errors.append("general.can_broker.max_pop_per_ecu must be >= 1")
     if cfg.can_broker_max_inject_per_cycle < 1:
         errors.append("general.can_broker.max_inject_per_cycle must be >= 1")
+    allowed_log_directions = {"tx", "rx"}
+    for peer_name, directions in cfg.can_broker_log_rules.items():
+        if not str(peer_name).strip():
+            errors.append("general.can_broker.log_rules must not contain empty peer names")
+            break
+        if not directions:
+            errors.append(f"general.can_broker.log_rules['{peer_name}'] must contain 'tx' and/or 'rx'")
+            break
+        for direction in directions:
+            if str(direction).strip().lower() not in allowed_log_directions:
+                errors.append("general.can_broker.log_rules values must contain only 'tx' and/or 'rx'")
+                break
 
-    if not cfg.ecus and not cfg.can_clients:
-        warnings.append(
-            "No active endpoint in config ('ecus' disabled and no enabled 'can_clients')."
-        )
+    if not cfg.ecus:
+        warnings.append("No active ECU in 'ecus' (enable_ecu=false and ecu_in_debug=false for all)")
         return errors, warnings
 
     allowed_can_gates = {"PCSIM", "PEAK", "WAVESHARE"}
-    allowed_client_can_gates = {"PCSIM"}
     names_seen = set()
     pcsim_endpoints = set()
     pcsim_enabled_count = 0
@@ -150,6 +174,9 @@ def _validate_monitor_cfg(cfg: MonitorConfig) -> Tuple[List[str], List[str]]:
         if ecu.can_speed_bps <= 0:
             errors.append(f"{pfx}: can_speed_bps must be > 0")
 
+        if ecu.can_gate == "WAVESHARE":
+            _validate_waveshare_device_port(ecu.can_device_port, pfx, errors)
+
         if ecu.pcsim_timeout_s is not None and ecu.pcsim_timeout_s <= 0.0:
             errors.append(f"{pfx}: pcsim_timeout_s must be > 0")
         if ecu.pcsim_poll_sleep_s is not None and ecu.pcsim_poll_sleep_s < 0.0:
@@ -176,10 +203,6 @@ def _validate_monitor_cfg(cfg: MonitorConfig) -> Tuple[List[str], List[str]]:
         pfx = f"can_clients[{idx}] ({client.name})"
         if not client.name.strip():
             errors.append(f"{pfx}: name is empty")
-        if client.name in names_seen:
-            errors.append(f"{pfx}: duplicate endpoint name '{client.name}'")
-        names_seen.add(client.name)
-
         if not client.udp.host.strip():
             errors.append(f"{pfx}: udp.host is empty")
         if client.udp.port < 1 or client.udp.port > 65535:
@@ -188,32 +211,22 @@ def _validate_monitor_cfg(cfg: MonitorConfig) -> Tuple[List[str], List[str]]:
             errors.append(f"{pfx}: udp.timeout_s must be > 0")
         if client.udp.node < 0:
             errors.append(f"{pfx}: udp.node must be >= 0")
-
-        if client.can_gate not in allowed_client_can_gates:
-            errors.append(
-                f"{pfx}: can_gate '{client.can_gate}' invalid (allowed for can_clients: {sorted(allowed_client_can_gates)})"
-            )
-
-        if client.pcsim_timeout_s is not None and client.pcsim_timeout_s <= 0.0:
-            errors.append(f"{pfx}: pcsim_timeout_s must be > 0")
-        if client.pcsim_poll_sleep_s is not None and client.pcsim_poll_sleep_s < 0.0:
-            errors.append(f"{pfx}: pcsim_poll_sleep_s must be >= 0")
-        if client.pcsim_max_pop_per_cycle is not None and client.pcsim_max_pop_per_cycle < 1:
-            errors.append(f"{pfx}: pcsim_max_pop_per_cycle must be >= 1")
+        if client.can_gate not in allowed_can_gates:
+            errors.append(f"{pfx}: can_gate '{client.can_gate}' invalid (allowed: {sorted(allowed_can_gates)})")
         for node in client.pcsim_shared_can_nodes:
             if int(node) < 0:
                 errors.append(f"{pfx}: pcsim_shared_can_nodes contains invalid node {node}")
                 break
 
-        if client.can_gate == "PCSIM":
+        if client.enable_client and client.can_gate == "PCSIM":
             pcsim_enabled_count += 1
             endpoint = (client.udp.host, client.udp.port)
             if endpoint in pcsim_endpoints:
                 errors.append(f"{pfx}: duplicate PCSIM UDP endpoint {client.udp.host}:{client.udp.port}")
             pcsim_endpoints.add(endpoint)
 
-    if cfg.can_broker_enabled and pcsim_enabled_count < 1:
-        warnings.append("general.can_broker.enabled=true but no active PCSIM endpoint is configured")
+    if cfg.can_broker_enabled and pcsim_enabled_count < 2:
+        warnings.append("general.can_broker.enabled=true but fewer than 2 active PCSIM endpoints are enabled")
 
     return errors, warnings
 
@@ -314,10 +327,7 @@ def load_config(cfg_path: Path) -> MonitorConfig:
     for raw in data.get("can_clients", []):
         if not isinstance(raw, dict):
             continue
-        enabled = _as_bool(raw.get("enable_client", raw.get("enabled", True)), True)
-        if not enabled:
-            continue
-
+        enabled = _as_bool(raw.get("enable_client", True), True)
         udp_raw = raw.get("udp", {}) if isinstance(raw, dict) else {}
         udp = UdpConfig(
             host=str(udp_raw.get("host", "127.0.0.1")),
@@ -343,12 +353,6 @@ def load_config(cfg_path: Path) -> MonitorConfig:
                 udp=udp,
                 enable_client=enabled,
                 can_gate=str(raw.get("can_gate", "PCSIM")).upper(),
-                pcsim_timeout_s=float(pcsim_can["timeout_s"]) if "timeout_s" in pcsim_can else None,
-                pcsim_poll_sleep_s=float(pcsim_can["poll_sleep_s"]) if "poll_sleep_s" in pcsim_can else None,
-                pcsim_max_pop_per_cycle=int(pcsim_can["max_pop_per_cycle"]) if "max_pop_per_cycle" in pcsim_can else None,
-                pcsim_clear_can_tx_on_connect=_as_bool(pcsim_can.get("clear_can_tx_on_connect"), True)
-                if "clear_can_tx_on_connect" in pcsim_can
-                else None,
                 pcsim_shared_can_nodes=shared_nodes,
                 pcsim_rx_filters=[dict(v) for v in rx_filters_raw if isinstance(v, dict)],
             )
@@ -364,6 +368,15 @@ def load_config(cfg_path: Path) -> MonitorConfig:
         can_broker_poll_sleep_s=float(can_broker_raw.get("poll_sleep_s", 0.001)),
         can_broker_max_pop_per_ecu=max(1, int(can_broker_raw.get("max_pop_per_ecu", 128))),
         can_broker_max_inject_per_cycle=max(1, int(can_broker_raw.get("max_inject_per_cycle", 2048))),
+        can_broker_log_rules={
+            str(k).strip(): [
+                str(v).strip().lower()
+                for v in values
+                if str(v).strip()
+            ]
+            for k, values in can_broker_raw.get("log_rules", {}).items()
+            if str(k).strip() and isinstance(values, list)
+        } if isinstance(can_broker_raw.get("log_rules", {}), dict) else {},
     )
     errors, warnings = _validate_monitor_cfg(cfg)
     if errors:

@@ -43,6 +43,7 @@ class PcSimCanBrokerService:
         self._poll_sleep_s = max(0.0, float(cfg.can_broker_poll_sleep_s))
         self._max_pop = max(1, int(cfg.can_broker_max_pop_per_ecu))
         self._max_inject = max(1, int(cfg.can_broker_max_inject_per_cycle))
+        self._log_all = bool(cfg.can_broker_log_all)
         self._log_rules = {
             str(peer_name).strip().upper(): {str(direction).strip().lower() for direction in directions if str(direction).strip()}
             for peer_name, directions in cfg.can_broker_log_rules.items()
@@ -78,16 +79,20 @@ class PcSimCanBrokerService:
         }
 
     def _should_log_for_peers(self, *peer_names: str) -> bool:
-        if not self._log_rules:
+        if self._log_all:
             return True
+        if not self._log_rules:
+            return False
         for peer_name in peer_names:
             if str(peer_name).strip().upper() in self._log_rules:
                 return True
         return False
 
     def _should_log_route(self, src_name: str, routed_peers: List[str], skipped_peers: List[str], failed_peers: List[str]) -> bool:
-        if not self._log_rules:
+        if self._log_all:
             return True
+        if not self._log_rules:
+            return False
         src_directions = self._log_rules.get(str(src_name).strip().upper(), set())
         if "tx" in src_directions:
             return True
@@ -102,8 +107,10 @@ class PcSimCanBrokerService:
         return False
 
     def _should_log_pair(self, src_name: str, dst_name: str) -> bool:
-        if not self._log_rules:
+        if self._log_all:
             return True
+        if not self._log_rules:
+            return False
         src_directions = self._log_rules.get(str(src_name).strip().upper(), set())
         dst_directions = self._log_rules.get(str(dst_name).strip().upper(), set())
         return ("tx" in src_directions) or ("rx" in dst_directions)
@@ -157,6 +164,11 @@ class PcSimCanBrokerService:
             print(
                 "[INFO] CAN broker log filter "
                 f"rules={rules_txt}"
+            )
+        else:
+            print(
+                "[INFO] CAN broker log filter "
+                f"log_all={int(self._log_all)} rules=none"
             )
 
     @staticmethod
@@ -414,13 +426,17 @@ class PcSimCanBrokerService:
         return "; ".join(items)
 
     def _should_log_tx_for_peer(self, peer_name: str) -> bool:
-        if not self._log_rules:
+        if self._log_all:
             return True
+        if not self._log_rules:
+            return False
         return "tx" in self._log_rules.get(str(peer_name).strip().upper(), set())
 
     def _should_log_rx_for_peer(self, peer_name: str) -> bool:
-        if not self._log_rules:
+        if self._log_all:
             return True
+        if not self._log_rules:
+            return False
         return "rx" in self._log_rules.get(str(peer_name).strip().upper(), set())
 
     @staticmethod

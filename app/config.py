@@ -60,6 +60,7 @@ class MonitorConfig:
     can_broker_poll_sleep_s: float = 0.001
     can_broker_max_pop_per_ecu: int = 128
     can_broker_max_inject_per_cycle: int = 2048
+    can_broker_log_all: bool = False
     can_broker_log_rules: Dict[str, List[str]] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
@@ -368,6 +369,7 @@ def load_config(cfg_path: Path) -> MonitorConfig:
         can_broker_poll_sleep_s=float(can_broker_raw.get("poll_sleep_s", 0.001)),
         can_broker_max_pop_per_ecu=max(1, int(can_broker_raw.get("max_pop_per_ecu", 128))),
         can_broker_max_inject_per_cycle=max(1, int(can_broker_raw.get("max_inject_per_cycle", 2048))),
+        can_broker_log_all=_as_bool(can_broker_raw.get("log_all", False), False),
         can_broker_log_rules={
             str(k).strip(): [
                 str(v).strip().lower()
